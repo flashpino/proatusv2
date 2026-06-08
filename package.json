@@ -1,0 +1,15 @@
+{
+  "name": "cpd-monitor-v2",
+  "version": "2.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "npm run dev --workspace=backend & npm run dev --workspace=frontend",
+    "dev:backend": "npm run dev --workspace=backend",
+    "dev:frontend": "npm run dev --workspace=frontend",
+    "install:all": "npm install --workspace=backend && npm install --workspace=frontend"
+  },
+  "workspaces": [
+    "backend",
+    "frontend"
+  ]
+}

@@ -1,0 +1,648 @@
+// src/api/routes/index.js
+const express  = require('express');
+const bcrypt   = require('bcryptjs');
+const jwt      = require('jsonwebtoken');
+const { mysqlPool } = require('../../../config/database');
+const influxService = require('../../services/influx.service');
+const { authMiddleware, requireRole, scopeToClient } = require('../middleware/auth');
+const { checkHeartbeats } = require('../../rules/heartbeat');
+
+const sseService = require('../../services/sse.service');
+
+// Auto-wrap async handlers para Express 4 (que não captura rejeições de promises)
+const router = (() => {
+  const r = express.Router();
+  ['get', 'post', 'put', 'delete', 'patch'].forEach(method => {
+    const orig = r[method].bind(r);
+    r[method] = (path, ...fns) => orig(path, ...fns.map(fn =>
+      fn && fn.constructor && fn.constructor.name === 'AsyncFunction'
+        ? (req, res, next) => fn(req, res, next).catch(next)
+        : fn
+    ));
+  });
+  return r;
+})();
+
+const auth = authMiddleware;
+
+// ============================================================
+// AUTH
+// ============================================================
+
+// POST /api/auth/login
+router.post('/auth/login', async (req, res) => {
+  const { email, password } = req.body;
+  if (!email || !password)
+    return res.status(400).json({ error: 'email e password obrigatórios' });
+
+  const [rows] = await mysqlPool.query(
+    'SELECT id, password_hash, role, client_id, active FROM users WHERE email = ?',
+    [email],
+  );
+  const user = rows[0];
+  if (!user || !user.active)
+    return res.status(401).json({ error: 'Credenciais inválidas' });
+
+  const valid = await bcrypt.compare(password, user.password_hash);
+  if (!valid)
+    return res.status(401).json({ error: 'Credenciais inválidas' });
+
+  await mysqlPool.query('UPDATE users SET last_login_at = NOW() WHERE id = ?', [user.id]);
+
+  const token = jwt.sign(
+    { sub: user.id, role: user.role, client_id: user.client_id },
+    process.env.JWT_SECRET,
+    { expiresIn: '12h' },
+  );
+  res.json({ token, role: user.role, client_id: user.client_id });
+});
+
+// ============================================================
+// CLIENTS (superadmin)
+// ============================================================
+
+router.get('/clients', auth, requireRole('superadmin'), async (req, res) => {
+  const [rows] = await mysqlPool.query(
+    'SELECT id, name, document, email, plan, active, created_at FROM clients ORDER BY name',
+  );
+  res.json(rows);
+});
+
+router.post('/clients', auth, requireRole('superadmin'), async (req, res) => {
+  const { name, document, email, phone, plan,
+    default_temp_max, default_temp_min, default_humidity_max, default_humidity_min } = req.body;
+  if (!name) return res.status(400).json({ error: 'name obrigatório' });
+
+  const [result] = await mysqlPool.query(
+    `INSERT INTO clients (name, document, email, phone, plan,
+       default_temp_max, default_temp_min, default_humidity_max, default_humidity_min)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [name, document || null, email || null, phone || null, plan || 'standard',
+     default_temp_max ?? 27, default_temp_min ?? 16,
+     default_humidity_max ?? 70, default_humidity_min ?? 30],
+  );
+  res.status(201).json({ id: result.insertId });
+});
+
+router.put('/clients/:id', auth, requireRole('superadmin'), async (req, res) => {
+  const fields = ['name','document','email','phone','plan','active',
+    'default_temp_max','default_temp_min','default_humidity_max','default_humidity_min',
+    'default_severity_warning_delta','default_severity_critical_delta'];
+  const updates = Object.fromEntries(
+    Object.entries(req.body).filter(([k]) => fields.includes(k)),
+  );
+  if (!Object.keys(updates).length)
+    return res.status(400).json({ error: 'Nenhum campo válido para atualizar' });
+
+  const set = Object.keys(updates).map(k => `${k} = ?`).join(', ');
+  await mysqlPool.query(
+    `UPDATE clients SET ${set} WHERE id = ?`,
+    [...Object.values(updates), req.params.id],
+  );
+  res.json({ ok: true });
+});
+
+router.delete('/clients/:id', auth, requireRole('superadmin'), async (req, res) => {
+  await mysqlPool.query('UPDATE clients SET active = 0 WHERE id = ?', [req.params.id]);
+  res.json({ ok: true });
+});
+
+// ============================================================
+// CPDs
+// ============================================================
+
+router.get('/cpds', auth, scopeToClient, async (req, res) => {
+  const clientId = req.clientScope;
+  const where    = clientId ? 'WHERE c.client_id = ?' : '';
+  const params   = clientId ? [clientId] : [];
+  const [rows] = await mysqlPool.query(
+    `SELECT c.*, cl.name AS client_name FROM cpds c
+     JOIN clients cl ON cl.id = c.client_id
+     ${where} ORDER BY cl.name, c.name`,
+    params,
+  );
+  res.json(rows);
+});
+
+router.get('/cpds/:id', auth, scopeToClient, async (req, res) => {
+  const [rows] = await mysqlPool.query(
+    `SELECT c.*, cl.name AS client_name FROM cpds c
+     JOIN clients cl ON cl.id = c.client_id
+     WHERE c.id = ? ${req.clientScope ? 'AND c.client_id = ?' : ''}`,
+    req.clientScope ? [req.params.id, req.clientScope] : [req.params.id],
+  );
+  if (!rows[0]) return res.status(404).json({ error: 'CPD não encontrado' });
+  res.json(rows[0]);
+});
+
+router.put('/cpds/:id', auth, requireRole('superadmin','admin'), async (req, res) => {
+  const fields = ['name','location','timezone','active',
+    'temp_max','temp_min','humidity_max','humidity_min',
+    'heartbeat_interval_sec','heartbeat_timeout_sec',
+    'severity_warning_delta','severity_critical_delta'];
+  const updates = Object.fromEntries(
+    Object.entries(req.body).filter(([k]) => fields.includes(k)),
+  );
+  if (!Object.keys(updates).length)
+    return res.status(400).json({ error: 'Nenhum campo válido para atualizar' });
+
+  const set = Object.keys(updates).map(k => `${k} = ?`).join(', ');
+  await mysqlPool.query(
+    `UPDATE cpds SET ${set} WHERE id = ?`,
+    [...Object.values(updates), req.params.id],
+  );
+  res.json({ ok: true });
+});
+
+router.delete('/cpds/:id', auth, requireRole('superadmin','admin'), async (req, res) => {
+  await mysqlPool.query('UPDATE cpds SET active = 0 WHERE id = ?', [req.params.id]);
+  res.json({ ok: true });
+});
+
+router.post('/cpds', auth, requireRole('superadmin','admin'), async (req, res) => {
+  const { client_id, name, location, timezone,
+    temp_max, temp_min, humidity_max, humidity_min,
+    heartbeat_interval_sec, heartbeat_timeout_sec } = req.body;
+
+  // admin só pode criar CPD para seu próprio cliente
+  const cid = req.user.role === 'superadmin' ? client_id : req.user.client_id;
+  if (!cid || !name) return res.status(400).json({ error: 'client_id e name obrigatórios' });
+
+  const [result] = await mysqlPool.query(
+    `INSERT INTO cpds (client_id, name, location, timezone,
+       temp_max, temp_min, humidity_max, humidity_min,
+       heartbeat_interval_sec, heartbeat_timeout_sec)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [cid, name, location || null, timezone || 'America/Sao_Paulo',
+     temp_max || null, temp_min || null, humidity_max || null, humidity_min || null,
+     heartbeat_interval_sec || 60, heartbeat_timeout_sec || 180],
+  );
+  res.status(201).json({ id: result.insertId });
+});
+
+// ============================================================
+// DEVICES
+// ============================================================
+
+router.get('/cpds/:cpdId/devices', auth, scopeToClient, async (req, res) => {
+  const [rows] = await mysqlPool.query(
+    `SELECT d.id, d.name, d.mqtt_client_id, d.firmware_version,
+            d.active, d.last_seen_at,
+            d.temp_max, d.temp_min, d.humidity_max, d.humidity_min
+     FROM devices d
+     JOIN cpds c ON c.id = d.cpd_id
+     WHERE d.cpd_id = ? ${req.clientScope ? 'AND c.client_id = ?' : ''}`,
+    req.clientScope ? [req.params.cpdId, req.clientScope] : [req.params.cpdId],
+  );
+  res.json(rows);
+});
+
+router.get('/devices', auth, scopeToClient, async (req, res) => {
+  const clientId = req.clientScope;
+  const [rows] = await mysqlPool.query(
+    `SELECT d.id, d.name, d.mqtt_client_id, d.firmware_version,
+            d.active, d.last_seen_at, d.cpd_id,
+            c.name AS cpd_name, cl.id AS client_id, cl.name AS client_name
+     FROM devices d
+     JOIN cpds c ON c.id = d.cpd_id
+     JOIN clients cl ON cl.id = c.client_id
+     WHERE d.active = 1 ${clientId ? 'AND cl.id = ?' : ''}
+     ORDER BY cl.name, c.name, d.name`,
+    clientId ? [clientId] : [],
+  );
+  res.json(rows);
+});
+
+router.put('/devices/:id', auth, requireRole('superadmin','admin'), async (req, res) => {
+  const fields = ['name','active','temp_max','temp_min','humidity_max','humidity_min'];
+  const updates = Object.fromEntries(
+    Object.entries(req.body).filter(([k]) => fields.includes(k)),
+  );
+  if (!Object.keys(updates).length)
+    return res.status(400).json({ error: 'Nenhum campo válido para atualizar' });
+
+  const set = Object.keys(updates).map(k => `${k} = ?`).join(', ');
+  await mysqlPool.query(
+    `UPDATE devices SET ${set} WHERE id = ?`,
+    [...Object.values(updates), req.params.id],
+  );
+  res.json({ ok: true });
+});
+
+router.delete('/devices/:id', auth, requireRole('superadmin','admin'), async (req, res) => {
+  await mysqlPool.query('UPDATE devices SET active = 0 WHERE id = ?', [req.params.id]);
+  res.json({ ok: true });
+});
+
+router.post('/cpds/:cpdId/devices', auth, requireRole('superadmin','admin'), async (req, res) => {
+  const crypto = require('crypto');
+  const { name } = req.body;
+  if (!name) return res.status(400).json({ error: 'name obrigatório' });
+
+  const mqttClientId = `esp32-cpd${req.params.cpdId}-${Date.now()}`;
+  const token        = crypto.randomBytes(32).toString('hex');
+  const tokenHash    = crypto.createHash('sha256').update(token).digest('hex');
+
+  const [result] = await mysqlPool.query(
+    'INSERT INTO devices (cpd_id, name, mqtt_client_id, token) VALUES (?, ?, ?, ?)',
+    [req.params.cpdId, name, mqttClientId, tokenHash],
+  );
+
+  // Retorna o token em texto puro UMA VEZ — não é armazenado em claro
+  res.status(201).json({
+    id:             result.insertId,
+    mqtt_client_id: mqttClientId,
+    token,          // gravar no firmware agora — não será exibido novamente
+    note:           'Guarde o token agora. Ele não será exibido novamente.',
+  });
+});
+
+// ============================================================
+// CONTACTS
+// ============================================================
+
+router.get('/contacts', auth, scopeToClient, async (req, res) => {
+  const clientId = req.clientScope || req.query.client_id || req.user.client_id;
+  const whereClause = clientId ? 'WHERE c.client_id = ?' : '';
+  const params      = clientId ? [clientId] : [];
+  const [rows] = await mysqlPool.query(
+    `SELECT c.*, GROUP_CONCAT(
+       JSON_OBJECT(
+         'id', s.id, 'cpd_id', s.cpd_id, 'alert_type', s.alert_type,
+         'channel', s.channel, 'time_from', s.time_from, 'time_to', s.time_to,
+         'weekdays_mask', s.weekdays_mask, 'cooldown_minutes', s.cooldown_minutes,
+         'severity_min', s.severity_min, 'active', s.active
+       )
+     ) AS subscriptions_json
+     FROM contacts c
+     LEFT JOIN alert_subscriptions s ON s.contact_id = c.id
+     ${whereClause}
+     GROUP BY c.id`,
+    params,
+  );
+  const contacts = rows.map(r => ({
+    ...r,
+    subscriptions: r.subscriptions_json
+      ? JSON.parse(`[${r.subscriptions_json}]`)
+      : [],
+    subscriptions_json: undefined,
+  }));
+  res.json(contacts);
+});
+
+router.put('/contacts/:id', auth, requireRole('superadmin','admin'), async (req, res) => {
+  const { name, whatsapp, email, active } = req.body;
+  await mysqlPool.query(
+    `UPDATE contacts SET
+       name = COALESCE(?, name),
+       whatsapp = COALESCE(?, whatsapp),
+       email = COALESCE(?, email),
+       active = COALESCE(?, active)
+     WHERE id = ?`,
+    [name || null, whatsapp || null, email || null, active ?? null, req.params.id],
+  );
+  res.json({ ok: true });
+});
+
+router.delete('/contacts/:id', auth, requireRole('superadmin','admin'), async (req, res) => {
+  await mysqlPool.query('UPDATE contacts SET active = 0 WHERE id = ?', [req.params.id]);
+  res.json({ ok: true });
+});
+
+router.post('/contacts', auth, requireRole('superadmin','admin'), async (req, res) => {
+  const { name, whatsapp, email, subscriptions = [] } = req.body;
+  const clientId = req.user.role === 'superadmin'
+    ? req.body.client_id
+    : req.user.client_id;
+  if (!name || !clientId) return res.status(400).json({ error: 'name e client_id obrigatórios' });
+
+  const conn = await mysqlPool.getConnection();
+  await conn.beginTransaction();
+  try {
+    const [result] = await conn.query(
+      'INSERT INTO contacts (client_id, name, whatsapp, email) VALUES (?, ?, ?, ?)',
+      [clientId, name, whatsapp || null, email || null],
+    );
+    const contactId = result.insertId;
+
+    for (const sub of subscriptions) {
+      await conn.query(
+        `INSERT INTO alert_subscriptions
+           (contact_id, cpd_id, alert_type, channel, time_from, time_to,
+            weekdays_mask, cooldown_minutes, severity_min)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [contactId, sub.cpd_id || null, sub.alert_type || 'all',
+         sub.channel || 'whatsapp',
+         sub.time_from || '00:00:00', sub.time_to || '23:59:59',
+         sub.weekdays_mask ?? 127, sub.cooldown_minutes ?? 30,
+         sub.severity_min || 'warning'],
+      );
+    }
+    await conn.commit();
+    res.status(201).json({ id: contactId });
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    conn.release();
+  }
+});
+
+// ============================================================
+// ALERT SUBSCRIPTIONS
+// ============================================================
+
+router.post('/contacts/:contactId/subscriptions', auth, requireRole('superadmin','admin'), async (req, res) => {
+  const { cpd_id, alert_type, channel, time_from, time_to,
+          weekdays_mask, cooldown_minutes, severity_min } = req.body;
+  const [result] = await mysqlPool.query(
+    `INSERT INTO alert_subscriptions
+       (contact_id, cpd_id, alert_type, channel, time_from, time_to,
+        weekdays_mask, cooldown_minutes, severity_min)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [req.params.contactId, cpd_id || null, alert_type || 'all',
+     channel || 'whatsapp',
+     time_from || '00:00:00', time_to || '23:59:59',
+     weekdays_mask ?? 127, cooldown_minutes ?? 30,
+     severity_min || 'warning'],
+  );
+  res.status(201).json({
+    id: result.insertId,
+    contact_id: Number(req.params.contactId),
+    cpd_id: cpd_id || null,
+    alert_type: alert_type || 'all',
+    channel: channel || 'whatsapp',
+    time_from: time_from || '00:00:00',
+    time_to: time_to || '23:59:59',
+    weekdays_mask: weekdays_mask ?? 127,
+    cooldown_minutes: cooldown_minutes ?? 30,
+    severity_min: severity_min || 'warning',
+    active: 1,
+  });
+});
+
+router.put('/contacts/:contactId/subscriptions/:subId', auth, requireRole('superadmin','admin'), async (req, res) => {
+  const fields = ['cpd_id','alert_type','channel','time_from','time_to','weekdays_mask','cooldown_minutes','severity_min','active'];
+  const updates = Object.fromEntries(Object.entries(req.body).filter(([k]) => fields.includes(k)));
+  if (!Object.keys(updates).length) return res.status(400).json({ error: 'Nenhum campo válido' });
+  const set = Object.keys(updates).map(k => `${k} = ?`).join(', ');
+  await mysqlPool.query(
+    `UPDATE alert_subscriptions SET ${set} WHERE id = ? AND contact_id = ?`,
+    [...Object.values(updates), req.params.subId, req.params.contactId],
+  );
+  res.json({ ok: true });
+});
+
+router.delete('/contacts/:contactId/subscriptions/:subId', auth, requireRole('superadmin','admin'), async (req, res) => {
+  await mysqlPool.query(
+    'DELETE FROM alert_subscriptions WHERE id = ? AND contact_id = ?',
+    [req.params.subId, req.params.contactId],
+  );
+  res.json({ ok: true });
+});
+
+// ============================================================
+// LEITURAS E ALERTAS POR DEVICE
+// ============================================================
+
+router.get('/devices/:deviceId/readings', auth, scopeToClient, async (req, res) => {
+  const { limit = 60, from, to } = req.query;
+  const bucket = process.env.INFLUX_BUCKET;
+  const { getQueryApi } = require('../../../config/database');
+  const queryApi = getQueryApi();
+
+  const timeRange = (from && to)
+    ? `range(start: ${new Date(from).toISOString()}, stop: ${new Date(to).toISOString()})`
+    : `range(start: -${limit}m)`;
+
+  const query = `
+    from(bucket: "${bucket}")
+      |> ${timeRange}
+      |> filter(fn: (r) => r._measurement == "sensor_readings")
+      |> filter(fn: (r) => r.device_id == "${req.params.deviceId}")
+      |> filter(fn: (r) => r._field == "temperature" or r._field == "humidity")
+      |> aggregateWindow(every: 1m, fn: mean, createEmpty: false)
+      |> pivot(rowKey:["_time"], columnKey: ["_field"], valueColumn: "_value")
+      |> sort(columns: ["_time"], desc: true)
+      |> limit(n: ${parseInt(limit)})
+  `;
+
+  const rows = await new Promise((resolve, reject) => {
+    const acc = [];
+    queryApi.queryRows(query, {
+      next(row, meta) { acc.push(meta.toObject(row)); },
+      error(err) { reject(err); },
+      complete() { resolve(acc); },
+    });
+  });
+  res.json(rows);
+});
+
+router.get('/devices/:deviceId/alerts', auth, scopeToClient, async (req, res) => {
+  const { limit = 50, open_only } = req.query;
+  const [rows] = await mysqlPool.query(
+    `SELECT id, alert_type, severity, value, threshold, message, triggered_at, resolved_at
+     FROM alert_events
+     WHERE device_id = ?
+       ${open_only === '1' ? 'AND resolved_at IS NULL' : ''}
+     ORDER BY triggered_at DESC
+     LIMIT ?`,
+    [req.params.deviceId, parseInt(limit)],
+  );
+  res.json(rows);
+});
+
+// ============================================================
+// LEITURAS (InfluxDB)
+// ============================================================
+
+router.get('/cpds/:cpdId/readings', auth, scopeToClient, async (req, res) => {
+  const { limit = 60, from, to } = req.query;
+
+  let readings;
+  if (from && to) {
+    readings = await influxService.getReadingsByRange(
+      req.params.cpdId, new Date(from), new Date(to),
+    );
+  } else {
+    readings = await influxService.getLastReadings(req.params.cpdId, limit);
+  }
+  res.json(readings);
+});
+
+// ============================================================
+// ALERTAS (histórico)
+// ============================================================
+
+router.get('/cpds/:cpdId/alerts', auth, scopeToClient, async (req, res) => {
+  const { limit = 50, open_only } = req.query;
+  const [rows] = await mysqlPool.query(
+    `SELECT id, alert_type, severity, value, threshold, message,
+            triggered_at, resolved_at
+     FROM alert_events
+     WHERE cpd_id = ?
+       ${open_only === '1' ? 'AND resolved_at IS NULL' : ''}
+     ORDER BY triggered_at DESC
+     LIMIT ?`,
+    [req.params.cpdId, parseInt(limit)],
+  );
+  res.json(rows);
+});
+
+// Estatísticas globais para o dashboard
+router.get('/stats', auth, scopeToClient, async (req, res) => {
+  const clientId = req.clientScope;
+  const scope    = clientId ? 'AND c.client_id = ?' : '';
+  const params   = clientId ? [clientId] : [];
+
+  const [[{ total_clients }]] = await mysqlPool.query(
+    `SELECT COUNT(*) AS total_clients FROM clients WHERE active = 1 ${clientId ? 'AND id = ?' : ''}`,
+    clientId ? [clientId] : [],
+  );
+  const [[{ total_devices }]] = await mysqlPool.query(
+    `SELECT COUNT(*) AS total_devices FROM devices d
+     JOIN cpds c ON c.id = d.cpd_id WHERE d.active = 1 ${scope}`,
+    params,
+  );
+  const cutoff = new Date(Date.now() - 5 * 60 * 1000); // 5 min
+  const [[{ offline_devices }]] = await mysqlPool.query(
+    `SELECT COUNT(*) AS offline_devices FROM devices d
+     JOIN cpds c ON c.id = d.cpd_id
+     WHERE d.active = 1 AND (d.last_seen_at IS NULL OR d.last_seen_at < ?) ${scope}`,
+    [cutoff, ...params],
+  );
+  const [[{ recent_alerts }]] = await mysqlPool.query(
+    `SELECT COUNT(*) AS recent_alerts FROM alert_events ae
+     JOIN cpds c ON c.id = ae.cpd_id
+     WHERE ae.triggered_at >= DATE_SUB(NOW(), INTERVAL 7 DAY) ${scope}`,
+    params,
+  );
+
+  res.json({ total_clients, total_devices, offline_devices, online_devices: total_devices - offline_devices, recent_alerts });
+});
+
+// Telemetria atual de todos os dispositivos (última leitura por device)
+router.get('/telemetry', auth, scopeToClient, async (req, res) => {
+  const clientId = req.clientScope;
+  const [devices] = await mysqlPool.query(
+    `SELECT d.id, d.mqtt_client_id, d.last_seen_at, d.last_rssi,
+            d.connected_since, d.cpd_id,
+            c.client_id, c.name AS cpd_name, cl.name AS client_name,
+            COALESCE(c.temp_max, cl.default_temp_max)         AS temp_max,
+            COALESCE(c.temp_min, cl.default_temp_min)         AS temp_min,
+            COALESCE(c.humidity_max, cl.default_humidity_max) AS humidity_max,
+            COALESCE(c.humidity_min, cl.default_humidity_min) AS humidity_min
+     FROM devices d
+     JOIN cpds c ON c.id = d.cpd_id
+     JOIN clients cl ON cl.id = c.client_id
+     WHERE d.active = 1 AND c.active = 1 ${clientId ? 'AND c.client_id = ?' : ''}
+     ORDER BY cl.name, c.name`,
+    clientId ? [clientId] : [],
+  );
+
+  // Para cada device busca a última leitura no InfluxDB
+  const cutoff5m = new Date(Date.now() - 5 * 60 * 1000);
+  const results  = await Promise.all(devices.map(async d => {
+    const readings = await influxService.getLastReadings(d.cpd_id, 6); // últimos 6 min
+    const latest   = readings[0] || null;
+    const isOnline = d.last_seen_at && new Date(d.last_seen_at) > cutoff5m;
+    return {
+      ...d,
+      status:          isOnline ? 'online' : 'offline',
+      temperature:     latest?.temperature ?? null,
+      humidity:        latest?.humidity ?? null,
+      last_seen_at:    d.last_seen_at,
+      rssi:            d.last_rssi ?? null,
+      connected_since: d.connected_since ?? null,
+    };
+  }));
+
+  res.json(results);
+});
+
+// Dashboard: status atual de todos os CPDs do cliente
+router.get('/dashboard', auth, scopeToClient, async (req, res) => {
+  const clientId = req.clientScope || req.query.client_id;
+  const [cpds] = await mysqlPool.query(
+    `SELECT c.id, c.name, c.location, cl.name AS client_name,
+            (SELECT COUNT(*) FROM alert_events ae
+             WHERE ae.cpd_id = c.id AND ae.resolved_at IS NULL) AS open_alerts,
+            (SELECT d.last_seen_at FROM devices d
+             WHERE d.cpd_id = c.id AND d.active = 1
+             ORDER BY d.last_seen_at DESC LIMIT 1) AS last_seen
+     FROM cpds c
+     JOIN clients cl ON cl.id = c.client_id
+     WHERE c.active = 1 ${clientId ? 'AND c.client_id = ?' : ''}
+     ORDER BY cl.name, c.name`,
+    clientId ? [clientId] : [],
+  );
+  res.json(cpds);
+});
+// ============================================================
+// SSE — Server-Sent Events
+// ============================================================
+
+router.get('/sse', async (req, res) => {
+  // Autentica via query param (EventSource não suporta headers)
+  const token = req.query.token;
+  if (!token) return res.status(401).json({ error: 'token obrigatório' });
+
+  let payload;
+  try {
+    payload = jwt.verify(token, process.env.JWT_SECRET);
+  } catch {
+    return res.status(401).json({ error: 'token inválido' });
+  }
+
+  const clientScope = payload.role === 'superadmin' ? null : (payload.client_id || null);
+
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no'); // desativa buffer do nginx/caddy
+  res.flushHeaders();
+
+  const keepalive = setInterval(() => {
+    try { res.write(': keepalive\n\n'); } catch { clearInterval(keepalive); }
+  }, 20000);
+
+  res.on('close', () => clearInterval(keepalive));
+
+  sseService.addClient(res, clientScope);
+});
+
+// ============================================================
+// DEBUG (apenas admin)
+// ============================================================
+
+/**
+ * POST /api/debug/heartbeat
+ * Executa o heartbeat checker imediatamente (sem esperar o cron).
+ * Retorna os logs de execução via resposta JSON.
+ */
+router.post('/debug/heartbeat', auth, requireRole('admin'), async (req, res) => {
+  const started = Date.now();
+  const logs = [];
+
+  // Intercepta logs temporariamente
+  const originalInfo  = console.info;
+  const originalWarn  = console.warn;
+  const originalError = console.error;
+
+  try {
+    await checkHeartbeats();
+    res.json({
+      ok:          true,
+      durationMs:  Date.now() - started,
+      message:     'checkHeartbeats executado — veja os logs do container para detalhes',
+    });
+  } catch (err) {
+    res.status(500).json({
+      ok:    false,
+      error: err.message,
+      stack: err.stack,
+    });
+  }
+});
+
+module.exports = router;

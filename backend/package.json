@@ -1,0 +1,29 @@
+{
+  "name": "cpd-monitor-v2-backend",
+  "version": "2.0.0",
+  "description": "CPD Monitor v2 — backend Node.js/Express",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "nodemon src/index.js"
+  },
+  "dependencies": {
+    "@influxdata/influxdb-client": "^1.35.0",
+    "aedes": "^0.51.3",
+    "axios": "^1.7.2",
+    "bcryptjs": "^2.4.3",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "express-rate-limit": "^7.3.1",
+    "helmet": "^7.1.0",
+    "jsonwebtoken": "^9.0.2",
+    "mqtt": "^5.7.3",
+    "mysql2": "^3.10.1",
+    "node-cron": "^3.0.3",
+    "winston": "^3.13.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.4"
+  }
+}

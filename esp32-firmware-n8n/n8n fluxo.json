@@ -1,0 +1,466 @@
+{
+  "name": "CPD Monitor — Alertas WhatsApp",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "cpd-alerts",
+        "responseMode": "responseNode",
+        "options": {
+          "rawBody": true
+        }
+      },
+      "id": "a1c4526a-df80-4e3d-b45d-a5d63eac365a",
+      "name": "Webhook — Recebe alerta",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        -656,
+        80
+      ],
+      "webhookId": "cpd-alerts"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Valida o secret do webhook para garantir que veio do backend\nconst secret = $input.first().json.headers['x-webhook-secret'];\nconst expected = \"wuY1AfWhA283UKibufmp2qZHokZ4Xm6Z\";\n\nif (!secret || secret !== expected) {\n  throw new Error('Webhook secret inválido — requisição rejeitada');\n}\n\n// Extrai e normaliza o payload\nconst body = $input.first().json.body;\n\nreturn [{\n  json: {\n    dispatch_id:  body.dispatch_id,\n    channel:      body.channel,\n    destination:  body.destination,\n    alert_type:   body.alert_type,\n    severity:     body.severity,\n    value:        body.value,\n    threshold:    body.threshold,\n    cpd_name:     body.cpd_name,\n    client_name:  body.client_name,\n    contact_name: body.contact_name,\n    message:      body.message,\n    timestamp:    body.timestamp,\n  }\n}];"
+      },
+      "id": "ad130034-8f47-4983-b380-936d8da291bf",
+      "name": "Valida e extrai payload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -432,
+        80
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Monta a mensagem WhatsApp formatada por tipo de alerta\nconst d = $input.first().json;\n\nconst emojiMap = {\n  temp_high:     '🌡️🔴',\n  temp_low:      '🌡️🔵',\n  humidity_high: '💧🔴',\n  humidity_low:  '💧⚪',\n  comm_failure:  '📡🔴',\n  comm_restored: '📡✅',\n};\n\nconst titleMap = {\n  temp_high:     'TEMPERATURA ALTA',\n  temp_low:      'TEMPERATURA BAIXA',\n  humidity_high: 'UMIDADE ALTA',\n  humidity_low:  'UMIDADE BAIXA',\n  comm_failure:  'FALHA DE COMUNICAÇÃO',\n  comm_restored: 'COMUNICAÇÃO RESTAURADA',\n};\n\nconst severityTag = {\n  critical: '🚨 CRÍTICO',\n  warning:  '⚠️ ATENÇÃO',\n  info:     'ℹ️ INFO',\n};\n\nconst emoji = emojiMap[d.alert_type] || '⚠️';\nconst title = titleMap[d.alert_type] || d.alert_type.toUpperCase();\nconst sev   = severityTag[d.severity] || '';\n\n// Formata hora (UTC-3)\nconst dt = new Date(d.timestamp);\nconst hora = dt.toLocaleString('pt-BR', {\n  timeZone: 'America/Sao_Paulo',\n  day:  '2-digit', month: '2-digit', year: 'numeric',\n  hour: '2-digit', minute: '2-digit',\n});\n\nlet valorLine = '';\nif (d.value !== null && d.value !== undefined) {\n  const unit = ['temp_high','temp_low'].includes(d.alert_type) ? '°C' : '%';\n  valorLine = `\\n📊 *Valor atual:* ${d.value}${unit} (limite: ${d.threshold}${unit})`;\n}\n\nconst text = [\n  `${emoji} *${title}* ${sev}`,\n  ``,\n  `🏢 *Cliente:* ${d.client_name}`,\n  `🖥️ *CPD:* ${d.cpd_name}`,\n  valorLine,\n  ``,\n  `👤 *Para:* ${d.contact_name}`,\n  `🕐 *Horário:* ${hora}`,\n  ``,\n  `_CPD Monitor — ID#${d.dispatch_id}_`,\n].filter(l => l !== undefined).join('\\n');\n\nreturn [{ json: { ...d, whatsapp_text: text } }];"
+      },
+      "id": "e5717840-7235-47d1-8f2e-9301fe45b580",
+      "name": "Formata mensagem WhatsApp",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        16,
+        -16
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Verifica se o envio Evolution API foi bem-sucedido\nconst response = $input.first().json;\nconst input    = $('Formata mensagem WhatsApp').first().json;\n\n// Obtém o ID da mensagem de forma flexível (com suporte a response.data.key.id)\nconst ok = response.data?.key?.id || response.key?.id || response.key?.messageId || response.messageId || response.id;\n\nif (!ok) {\n  throw new Error(`Evolution API retornou erro: ${JSON.stringify(response)}`);\n}\n\n// Retorna o dispatch_id para o backend saber qual alerta atualizar\nreturn [{ json: { dispatch_id: input.dispatch_id, status: 'sent', provider_id: ok } }];\n"
+      },
+      "id": "6c494b80-fdc9-4844-a920-27bb6c358c07",
+      "name": "Verifica resposta Z-API",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        464,
+        -16
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Fallback: alerta chega pelo canal 'email' (extensível)\nconst d = $input.first().json;\nconsole.log('Canal email não implementado ainda para dispatch_id:', d.dispatch_id);\n// Adicione aqui integração com SendGrid, SES, SMTP etc.\nreturn [{ json: { dispatch_id: d.dispatch_id, status: 'skipped', reason: 'email_not_configured' } }];"
+      },
+      "id": "3f293c29-b6bb-49c5-9031-934118815b6b",
+      "name": "Canal e-mail (placeholder)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        96,
+        160
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ ok: true, dispatch_id: $json.dispatch_id }) }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "e0fcdff4-39cd-49eb-9e38-df8d40e026e4",
+      "name": "Responde 200 OK",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [
+        528,
+        208
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Captura erro de qualquer nó anterior e loga\nconst err = $input.first();\nconsole.error('Erro no fluxo de alerta CPD:', JSON.stringify(err));\n// Aqui você pode adicionar notificação de falha (email de sistema, etc.)\nreturn [{ json: { error: true, message: String(err) } }];"
+      },
+      "id": "26a3351a-ce76-4d4c-9204-806ba19fd0d2",
+      "name": "Tratamento de erro",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -656,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={ \"ok\": false, \"error\": \"internal_error\" }",
+        "options": {
+          "responseCode": 500
+        }
+      },
+      "id": "a4f6d95c-9edb-42bd-be01-254ce3c4d599",
+      "name": "Responde 500",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [
+        -368,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "messages-api",
+        "instanceName": "nti",
+        "remoteJid": "={{ $json.destination }}",
+        "messageText": "={{ $json.whatsapp_text }}",
+        "options_message": {}
+      },
+      "type": "n8n-nodes-evolution-api.evolutionApi",
+      "typeVersion": 1,
+      "position": [
+        240,
+        -16
+      ],
+      "id": "e5b18615-f20b-4fea-acc9-b14b35cf48cb",
+      "name": "Enviar texto",
+      "credentials": {
+        "evolutionApi": {
+          "id": "6qa7ZTh5GHoNxoe9",
+          "name": "evojk"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.twilio.com/2010-04-01/Accounts/YOUR_TWILIO_ACCOUNT_SID/Calls.json",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBasicAuth",
+        "sendBody": true,
+        "contentType": "form-urlencoded",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "To",
+              "value": "=+{{ $('Valida e extrai payload').item.json.destination }}"
+            },
+            {
+              "name": "From",
+              "value": "+551150285828"
+            },
+            {
+              "name": "Twiml",
+              "value": "=<Response><Say language=\"pt-BR\" voice=\"Google.pt-BR-Chirp3-HD-Charon\">\n   <break time=\"1s\"/>\nAtenção!\n    <break time=\"1s\"/>\nVerifique o sistema de climatização do {{ $('Webhook — Recebe alerta').item.json.body.cpd_name }}, a temperatura está em {{ $('Webhook — Recebe alerta').item.json.body.value }} graus\n</Say></Response>"
+            },
+            {
+              "name": "StatusCallback",
+              "value": "https://webhook.snipex.com.br/webhook/43ec4958-3761-4c83-aa75-7dec0abc17e5"
+            },
+            {
+              "name": "MachineDetection",
+              "value": "Enable"
+            },
+            {
+              "name": "StatusCallbackMethod",
+              "value": "POST"
+            },
+            {
+              "name": "StatusCallbackEvent",
+              "value": "initiated"
+            },
+            {
+              "name": "StatusCallbackEvent",
+              "value": "ringing"
+            },
+            {
+              "name": "StatusCallbackEvent",
+              "value": "answered"
+            },
+            {
+              "name": "StatusCallbackEvent",
+              "value": "completed"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        -32,
+        336
+      ],
+      "id": "79b4dd4c-89fe-4c1f-b149-d464b69d3812",
+      "name": "HTTP Request",
+      "credentials": {
+        "httpBasicAuth": {
+          "id": "jdZnwX8Kr0vs9ePt",
+          "name": "Unnamed credential"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.channel }}",
+                    "rightValue": "whatsapp",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "id": "b846245c-f45d-4650-87a5-b2bc6e9d08ef"
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "zap"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "eedd2e2c-e8ac-48dd-9c4d-7a89a368061f",
+                    "leftValue": "={{ $json.channel }}",
+                    "rightValue": "email",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals",
+                      "name": "filter.operator.equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "mail"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "b66266eb-8d1b-4377-b3f7-b3fb7a3f494e",
+                    "leftValue": "={{ $json.channel }}",
+                    "rightValue": "call",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals",
+                      "name": "filter.operator.equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "liga"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
+      "position": [
+        -208,
+        80
+      ],
+      "id": "d6ca9915-3f6c-46da-81d6-1ad62db3b358",
+      "name": "Switch"
+    }
+  ],
+  "pinData": {
+    "Webhook — Recebe alerta": [
+      {
+        "json": {
+          "headers": {
+            "x-webhook-secret": "wuY1AfWhA283UKibufmp2qZHokZ4Xm6Z",
+            "content-type": "application/json"
+          },
+          "params": {},
+          "query": {},
+          "body": {
+            "dispatch_id": 100,
+            "channel": "whatsapp",
+            "destination": "5511999999999",
+            "alert_type": "temp_high",
+            "severity": "critical",
+            "value": 32.5,
+            "threshold": 27,
+            "cpd_name": "CPD Principal",
+            "client_name": "Proatus TI",
+            "contact_name": "Anderson",
+            "message": "Temperatura alta detectada no rack central!",
+            "timestamp": "2026-06-03T17:25:00.000Z"
+          }
+        }
+      }
+    ]
+  },
+  "connections": {
+    "Webhook — Recebe alerta": {
+      "main": [
+        [
+          {
+            "node": "Valida e extrai payload",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Valida e extrai payload": {
+      "main": [
+        [
+          {
+            "node": "Switch",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Formata mensagem WhatsApp": {
+      "main": [
+        [
+          {
+            "node": "Enviar texto",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verifica resposta Z-API": {
+      "main": [
+        [
+          {
+            "node": "Responde 200 OK",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Canal e-mail (placeholder)": {
+      "main": [
+        [
+          {
+            "node": "Responde 200 OK",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Tratamento de erro": {
+      "main": [
+        [
+          {
+            "node": "Responde 500",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Enviar texto": {
+      "main": [
+        [
+          {
+            "node": "Verifica resposta Z-API",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Responde 200 OK": {
+      "main": [
+        []
+      ]
+    },
+    "Switch": {
+      "main": [
+        [
+          {
+            "node": "Formata mensagem WhatsApp",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Canal e-mail (placeholder)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "HTTP Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HTTP Request": {
+      "main": [
+        [
+          {
+            "node": "Responde 200 OK",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "5b47c9cc-7e04-4772-a48e-e5341d07a99e",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "fd268d0acee1ac6c0ce611bea26da4e1922b931cbd4ed71c693e4ff13194af8e"
+  },
+  "id": "Mo7DQmOoWUuHpM3s",
+  "tags": []
+}
