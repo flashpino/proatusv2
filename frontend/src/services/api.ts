@@ -75,7 +75,7 @@ export const api = {
   getDeviceAlerts: (deviceId: number, limit = 50) => request<any[]>(`/devices/${deviceId}/alerts?limit=${limit}`),
 
   // Firmware OTA
-  getFirmwareStatus: () => request<any>('/firmware/status'),
+  getFirmwareStatus: () => request<any[]>('/firmware/status'),
   uploadFirmware: (formData: FormData) => {
     const token = getToken()
     return fetch(`${BASE}/firmware/upload`, {

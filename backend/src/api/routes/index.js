@@ -729,38 +729,45 @@ async function deviceAuth(req, res, next) {
   } catch (err) { next(err); }
 }
 
-// GET /api/firmware/manifest → { version, file, md5, size }
-router.get('/firmware/manifest', deviceAuth, async (req, res) => {
-  const manifestPath = fwPath.join(FIRMWARE_DIR, 'manifest.json');
-  if (!fwFs.existsSync(manifestPath))
-    return res.status(404).json({ error: 'nenhum firmware publicado' });
+// Helpers: caminhos de manifest e bin por device
+function manifestPath(deviceId) {
+  return fwPath.join(FIRMWARE_DIR, `manifest-${deviceId}.json`);
+}
+function binPath(deviceId) {
+  return fwPath.join(FIRMWARE_DIR, `firmware-${deviceId}.bin`);
+}
 
-  const manifest = JSON.parse(fwFs.readFileSync(manifestPath, 'utf8'));
-  const binPath  = fwPath.join(FIRMWARE_DIR, fwPath.basename(manifest.file || ''));
-  if (!manifest.version || !manifest.file || !fwFs.existsSync(binPath))
+// GET /api/firmware/manifest — manifest do device autenticado
+router.get('/firmware/manifest', deviceAuth, async (req, res) => {
+  const mp = manifestPath(req.deviceId);
+  if (!fwFs.existsSync(mp))
+    return res.status(404).json({ error: 'nenhum firmware publicado para este device' });
+
+  const manifest = JSON.parse(fwFs.readFileSync(mp, 'utf8'));
+  const bp       = binPath(req.deviceId);
+  if (!manifest.version || !fwFs.existsSync(bp))
     return res.status(404).json({ error: 'manifest inconsistente' });
 
   res.json({
     version: manifest.version,
     md5:     manifest.md5 || null,
-    size:    fwFs.statSync(binPath).size,
+    size:    fwFs.statSync(bp).size,
     url:     '/api/firmware/bin',
   });
 });
 
-// GET /api/firmware/bin → binário do firmware publicado no manifest
+// GET /api/firmware/bin — binário do device autenticado
 router.get('/firmware/bin', deviceAuth, async (req, res) => {
-  const manifestPath = fwPath.join(FIRMWARE_DIR, 'manifest.json');
-  if (!fwFs.existsSync(manifestPath)) return res.status(404).end();
+  const mp = manifestPath(req.deviceId);
+  if (!fwFs.existsSync(mp)) return res.status(404).end();
 
-  const manifest = JSON.parse(fwFs.readFileSync(manifestPath, 'utf8'));
-  // basename impede path traversal via manifest adulterado
-  const binPath = fwPath.join(FIRMWARE_DIR, fwPath.basename(manifest.file || ''));
-  if (!fwFs.existsSync(binPath)) return res.status(404).end();
+  const manifest = JSON.parse(fwFs.readFileSync(mp, 'utf8'));
+  const bp       = binPath(req.deviceId);
+  if (!fwFs.existsSync(bp)) return res.status(404).end();
 
   res.setHeader('Content-Type', 'application/octet-stream');
   if (manifest.md5) res.setHeader('x-md5', manifest.md5);
-  fwFs.createReadStream(binPath).pipe(res);
+  fwFs.createReadStream(bp).pipe(res);
 });
 
 // ============================================================
@@ -768,36 +775,47 @@ router.get('/firmware/bin', deviceAuth, async (req, res) => {
 // ============================================================
 
 const multer = require('multer');
-const fwUploadStorage = multer.diskStorage({
-  destination: (_req, _file, cb) => {
-    if (!fwFs.existsSync(FIRMWARE_DIR)) fwFs.mkdirSync(FIRMWARE_DIR, { recursive: true });
-    cb(null, FIRMWARE_DIR);
-  },
-  filename: (_req, _file, cb) => cb(null, 'firmware.bin'),
-});
 const fwUpload = multer({
-  storage: fwUploadStorage,
-  limits: { fileSize: 4 * 1024 * 1024 }, // 4 MB máx
+  storage: multer.memoryStorage(), // guarda em buffer; salvamos depois com deviceId no nome
+  limits: { fileSize: 10 * 1024 * 1024 }, // 10 MB máx
   fileFilter: (_req, file, cb) => {
     if (file.originalname.endsWith('.bin')) cb(null, true);
     else cb(new Error('Apenas arquivos .bin são aceitos'));
   },
 });
 
-// GET /api/firmware/status — versão publicada atual
+// GET /api/firmware/status — lista todos os devices com firmware publicado
 router.get('/firmware/status', auth, requireRole('superadmin'), async (req, res) => {
-  const manifestPath = fwPath.join(FIRMWARE_DIR, 'manifest.json');
-  if (!fwFs.existsSync(manifestPath))
-    return res.json({ published: false });
+  const [devices] = await mysqlPool.query(
+    `SELECT d.id, d.name AS device_name, d.firmware_version,
+            c.name AS cpd_name, cl.name AS client_name
+     FROM devices d
+     JOIN cpds c ON c.id = d.cpd_id
+     JOIN clients cl ON cl.id = c.client_id
+     WHERE d.active = 1
+     ORDER BY cl.name, c.name, d.name`,
+  );
 
-  const manifest = JSON.parse(fwFs.readFileSync(manifestPath, 'utf8'));
-  const binPath  = fwPath.join(FIRMWARE_DIR, fwPath.basename(manifest.file || ''));
-  const size     = fwFs.existsSync(binPath) ? fwFs.statSync(binPath).size : null;
+  const result = devices.map(d => {
+    const mp = manifestPath(d.id);
+    if (!fwFs.existsSync(mp)) return { ...d, published: false };
+    const manifest = JSON.parse(fwFs.readFileSync(mp, 'utf8'));
+    const bp = binPath(d.id);
+    return {
+      ...d,
+      published:   true,
+      version:     manifest.version,
+      md5:         manifest.md5,
+      notes:       manifest.notes,
+      uploaded_at: manifest.uploaded_at,
+      size:        fwFs.existsSync(bp) ? fwFs.statSync(bp).size : null,
+    };
+  });
 
-  res.json({ published: true, ...manifest, size });
+  res.json(result);
 });
 
-// POST /api/firmware/upload — publica novo firmware
+// POST /api/firmware/upload — publica firmware para um device específico
 router.post(
   '/firmware/upload',
   auth,
@@ -808,50 +826,47 @@ router.post(
   }),
   async (req, res) => {
     if (!req.file) return res.status(400).json({ error: 'arquivo .bin obrigatório' });
-    const { version, notes } = req.body;
+    const { version, notes, device_id } = req.body;
     if (!version || !/^[\w.\-+]+$/.test(version))
       return res.status(400).json({ error: 'version obrigatório (letras, números, . - +)' });
+    if (!device_id || !Number.isInteger(Number(device_id)))
+      return res.status(400).json({ error: 'device_id obrigatório' });
 
-    const binPath = req.file.path;
-    const md5 = fwCrypto
-      .createHash('md5')
-      .update(fwFs.readFileSync(binPath))
-      .digest('hex');
+    const devId = Number(device_id);
+    const [rows] = await mysqlPool.query('SELECT id FROM devices WHERE id = ? AND active = 1', [devId]);
+    if (!rows[0]) return res.status(404).json({ error: 'device não encontrado' });
+
+    if (!fwFs.existsSync(FIRMWARE_DIR)) fwFs.mkdirSync(FIRMWARE_DIR, { recursive: true });
+
+    const bp  = binPath(devId);
+    const md5 = fwCrypto.createHash('md5').update(req.file.buffer).digest('hex');
+    fwFs.writeFileSync(bp, req.file.buffer);
 
     const manifest = {
       version,
-      file:        'firmware.bin',
       md5,
       notes:       notes || null,
       uploaded_at: new Date().toISOString(),
     };
-    fwFs.writeFileSync(
-      fwPath.join(FIRMWARE_DIR, 'manifest.json'),
-      JSON.stringify(manifest, null, 2),
-    );
-    res.json({ ok: true, ...manifest, size: req.file.size });
+    fwFs.writeFileSync(manifestPath(devId), JSON.stringify(manifest, null, 2));
+
+    res.json({ ok: true, device_id: devId, ...manifest, size: req.file.size });
   },
 );
 
 // POST /api/firmware/trigger — envia cmd "update" para devices via MQTT
 router.post('/firmware/trigger', auth, requireRole('superadmin'), async (req, res) => {
-  const { device_ids } = req.body; // array de IDs do banco; vazio = todos ativos
+  const { device_ids } = req.body;
+  if (!Array.isArray(device_ids) || device_ids.length === 0)
+    return res.status(400).json({ error: 'device_ids obrigatório' });
 
-  let devices;
-  if (Array.isArray(device_ids) && device_ids.length > 0) {
-    const ids = device_ids.filter(id => Number.isInteger(Number(id)));
-    if (!ids.length) return res.status(400).json({ error: 'device_ids inválidos' });
-    const [rows] = await mysqlPool.query(
-      'SELECT mqtt_client_id FROM devices WHERE id IN (?) AND active = 1',
-      [ids],
-    );
-    devices = rows;
-  } else {
-    const [rows] = await mysqlPool.query(
-      'SELECT mqtt_client_id FROM devices WHERE active = 1',
-    );
-    devices = rows;
-  }
+  const ids = device_ids.map(Number).filter(Number.isInteger);
+  if (!ids.length) return res.status(400).json({ error: 'device_ids inválidos' });
+
+  const [devices] = await mysqlPool.query(
+    'SELECT id, mqtt_client_id FROM devices WHERE id IN (?) AND active = 1',
+    [ids],
+  );
 
   const { publishCommand } = require('../../mqtt/client');
   let sent = 0;
