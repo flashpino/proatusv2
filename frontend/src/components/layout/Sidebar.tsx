@@ -1,16 +1,19 @@
 import { NavLink, useNavigate } from 'react-router-dom'
-import { Server, Users, LayoutDashboard, LogOut } from 'lucide-react'
+import { Server, Users, LayoutDashboard, LogOut, Cpu } from 'lucide-react'
 import { clsx } from 'clsx'
 import { useAuth } from '../../hooks/useAuth'
-
-const navItems = [
-  { to: '/dashboard', icon: LayoutDashboard, label: 'Dashboard' },
-  { to: '/clients', icon: Users, label: 'Clientes' },
-]
 
 export default function Sidebar() {
   const { logout, user } = useAuth()
   const navigate = useNavigate()
+
+  const navItems = [
+    { to: '/dashboard', icon: LayoutDashboard, label: 'Dashboard' },
+    { to: '/clients', icon: Users, label: 'Clientes' },
+    ...(user?.role === 'superadmin'
+      ? [{ to: '/firmware', icon: Cpu, label: 'Firmware OTA' }]
+      : []),
+  ]
 
   function handleLogout() {
     logout()

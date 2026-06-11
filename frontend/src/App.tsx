@@ -7,6 +7,7 @@ import ClientDetailPage from './pages/Clients/ClientDetailPage'
 import LocalDetailPage from './pages/Clients/LocalDetailPage'
 import SensorDetailPage from './pages/Clients/SensorDetailPage'
 import ContactDetailPage from './pages/Clients/ContactDetailPage'
+import FirmwarePage from './pages/Firmware/FirmwarePage'
 
 export default function App() {
   return (
@@ -21,6 +22,7 @@ export default function App() {
           <Route path="/clients/:clientId/cpds/:cpdId" element={<LocalDetailPage />} />
           <Route path="/clients/:clientId/cpds/:cpdId/devices/:deviceId" element={<SensorDetailPage />} />
           <Route path="/clients/:clientId/contacts/:contactId" element={<ContactDetailPage />} />
+          <Route path="/firmware" element={<FirmwarePage />} />
         </Route>
       </Routes>
     </BrowserRouter>

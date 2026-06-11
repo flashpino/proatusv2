@@ -74,6 +74,28 @@ export const api = {
   getDeviceReadings: (deviceId: number, limit = 60) => request<any[]>(`/devices/${deviceId}/readings?limit=${limit}`),
   getDeviceAlerts: (deviceId: number, limit = 50) => request<any[]>(`/devices/${deviceId}/alerts?limit=${limit}`),
 
+  // Firmware OTA
+  getFirmwareStatus: () => request<any>('/firmware/status'),
+  uploadFirmware: (formData: FormData) => {
+    const token = getToken()
+    return fetch(`${BASE}/firmware/upload`, {
+      method: 'POST',
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+      body: formData,
+    }).then(async res => {
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}))
+        throw new Error(body.error || `Erro ${res.status}`)
+      }
+      return res.json()
+    })
+  },
+  triggerFirmwareUpdate: (device_ids?: number[]) =>
+    request<{ ok: boolean; sent: number; total: number }>('/firmware/trigger', {
+      method: 'POST',
+      body: JSON.stringify({ device_ids: device_ids ?? [] }),
+    }),
+
   // Dashboard
   getStats: () => request<any>('/stats'),
   getTelemetry: () => request<any[]>('/telemetry'),
