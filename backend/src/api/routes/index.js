@@ -315,30 +315,29 @@ router.post('/cpds/:cpdId/devices', auth, requireRole('superadmin','admin'), asy
 
 router.get('/contacts', auth, scopeToClient, async (req, res) => {
   const clientId = req.clientScope || req.query.client_id || req.user.client_id;
-  const whereClause = clientId ? 'WHERE c.client_id = ?' : '';
+  const whereClause = clientId ? 'WHERE client_id = ?' : '';
   const params      = clientId ? [clientId] : [];
-  const [rows] = await mysqlPool.query(
-    `SELECT c.*, (
-       SELECT GROUP_CONCAT(JSON_OBJECT(
-         'id', s.id, 'cpd_id', s.cpd_id, 'alert_type', s.alert_type,
-         'channel', s.channel, 'time_from', s.time_from, 'time_to', s.time_to,
-         'weekdays_mask', s.weekdays_mask, 'cooldown_minutes', s.cooldown_minutes,
-         'severity_min', s.severity_min, 'active', s.active
-       ))
-       FROM alert_subscriptions s WHERE s.contact_id = c.id
-     ) AS subscriptions_json
-     FROM contacts c
-     ${whereClause}`,
+  const [contacts] = await mysqlPool.query(
+    `SELECT * FROM contacts ${whereClause}`,
     params,
   );
-  const contacts = rows.map(r => ({
-    ...r,
-    subscriptions: r.subscriptions_json
-      ? JSON.parse(`[${r.subscriptions_json}]`).filter(s => s && s.id !== null)
-      : [],
-    subscriptions_json: undefined,
-  }));
-  res.json(contacts);
+  if (!contacts.length) return res.json([]);
+  const contactIds = contacts.map(c => c.id);
+  const [subs] = await mysqlPool.query(
+    `SELECT id, contact_id, cpd_id, alert_type, channel,
+            TIME_FORMAT(time_from, '%H:%i') AS time_from,
+            TIME_FORMAT(time_to,   '%H:%i') AS time_to,
+            weekdays_mask, cooldown_minutes, severity_min, active
+     FROM alert_subscriptions
+     WHERE contact_id IN (?)`,
+    [contactIds],
+  );
+  const subsByContact = {};
+  for (const s of subs) {
+    if (!subsByContact[s.contact_id]) subsByContact[s.contact_id] = [];
+    subsByContact[s.contact_id].push(s);
+  }
+  res.json(contacts.map(c => ({ ...c, subscriptions: subsByContact[c.id] || [] })));
 });
 
 router.put('/contacts/:id', auth, requireRole('superadmin','admin'), async (req, res) => {
