@@ -25,13 +25,6 @@ function daysToMask(days: number[]): number {
   return days.reduce((acc, d) => acc | (1 << d), 0)
 }
 
-function authHeaders() {
-  return {
-    'Content-Type': 'application/json',
-    Authorization: `Bearer ${localStorage.getItem('cpd_token')}`,
-  }
-}
-
 const DEFAULT_SUB: Partial<AlertSubscription> = {
   alert_type: 'all',
   channel: 'whatsapp',
@@ -173,22 +166,19 @@ export default function ContactDetailPage() {
   }
 
   async function addSub(sub: Partial<AlertSubscription>) {
-    const res = await fetch(`/api/contacts/${contactId}/subscriptions`, { method: 'POST', headers: authHeaders(), body: JSON.stringify(sub) })
-    if (!res.ok) return
-    const created = await res.json()
+    const created = await api.createSubscription(Number(contactId), sub)
     setContact(c => c ? { ...c, subscriptions: [...c.subscriptions, created] } : c)
     setShowAddForm(false)
   }
 
   async function updateSub(subId: number, sub: Partial<AlertSubscription>) {
-    const res = await fetch(`/api/contacts/${contactId}/subscriptions/${subId}`, { method: 'PUT', headers: authHeaders(), body: JSON.stringify(sub) })
-    if (!res.ok) return
+    await api.updateSubscription(Number(contactId), subId, sub)
     setContact(c => c ? { ...c, subscriptions: c.subscriptions.map(s => s.id === subId ? { ...s, ...sub } : s) } : c)
     setEditingId(null)
   }
 
   async function deleteSub(subId: number) {
-    await fetch(`/api/contacts/${contactId}/subscriptions/${subId}`, { method: 'DELETE', headers: authHeaders() })
+    await api.deleteSubscription(Number(contactId), subId)
     setContact(c => c ? { ...c, subscriptions: c.subscriptions.filter(s => s.id !== subId) } : c)
   }
 

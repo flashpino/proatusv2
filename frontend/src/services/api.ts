@@ -60,6 +60,14 @@ export const api = {
   updateContact: (id: number, data: any) => request<{ ok: boolean }>(`/contacts/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
   deleteContact: (id: number) => request<{ ok: boolean }>(`/contacts/${id}`, { method: 'DELETE' }),
 
+  // Subscriptions
+  createSubscription: (contactId: number, data: any) =>
+    request<any>(`/contacts/${contactId}/subscriptions`, { method: 'POST', body: JSON.stringify(data) }),
+  updateSubscription: (contactId: number, subId: number, data: any) =>
+    request<{ ok: boolean }>(`/contacts/${contactId}/subscriptions/${subId}`, { method: 'PUT', body: JSON.stringify(data) }),
+  deleteSubscription: (contactId: number, subId: number) =>
+    request<{ ok: boolean }>(`/contacts/${contactId}/subscriptions/${subId}`, { method: 'DELETE' }),
+
   // Readings & Alerts
   getCPDReadings: (cpdId: number, limit = 60) => request<any[]>(`/cpds/${cpdId}/readings?limit=${limit}`),
   getCPDAlerts: (cpdId: number, limit = 50) => request<any[]>(`/cpds/${cpdId}/alerts?limit=${limit}`),

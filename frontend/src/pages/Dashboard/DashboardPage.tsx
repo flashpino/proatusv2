@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import { useNavigate } from 'react-router-dom'
 import { Server, Wifi, WifiOff, AlertTriangle, Activity, Radio, Clock } from 'lucide-react'
 import { api } from '../../services/api'
 import { useSSE } from '../../hooks/useSSE'
@@ -49,7 +50,7 @@ function formatUptime(connectedSince: string | null | undefined): string {
   return `${Math.floor(secs / 86400)}d ${Math.floor((secs % 86400) / 3600)}h`
 }
 
-function SensorCard({ device }: { device: TelemetryReading }) {
+function SensorCard({ device, onClick }: { device: TelemetryReading; onClick: () => void }) {
   const isOnline = device.status === 'online'
   const tempOk = device.temperature != null &&
     device.temperature >= device.temp_min &&
@@ -59,7 +60,10 @@ function SensorCard({ device }: { device: TelemetryReading }) {
     device.humidity <= device.humidity_max
 
   return (
-    <div className={`bg-gray-900 border rounded-xl p-5 ${isOnline ? 'border-gray-800' : 'border-red-800/50'}`}>
+    <div
+      onClick={onClick}
+      className={`bg-gray-900 border rounded-xl p-5 cursor-pointer hover:border-gray-600 transition-colors ${isOnline ? 'border-gray-800' : 'border-red-800/50'}`}
+    >
       <div className="flex items-start justify-between mb-4">
         <div className="flex-1 min-w-0">
           <p className="font-semibold text-white truncate">{device.cpd_name}</p>
@@ -108,6 +112,7 @@ function SensorCard({ device }: { device: TelemetryReading }) {
 }
 
 export default function DashboardPage() {
+  const navigate = useNavigate()
   const [stats, setStats] = useState<DashboardStats | null>(null)
   const [telemetry, setTelemetry] = useState<TelemetryReading[]>([])
   const [loading, setLoading] = useState(true)
@@ -177,7 +182,11 @@ export default function DashboardPage() {
         ) : (
           <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
             {telemetry.map(device => (
-              <SensorCard key={device.id} device={device} />
+              <SensorCard
+                key={device.id}
+                device={device}
+                onClick={() => navigate(`/clients/${device.client_id}/cpds/${device.cpd_id}/devices/${device.id}`)}
+              />
             ))}
           </div>
         )}

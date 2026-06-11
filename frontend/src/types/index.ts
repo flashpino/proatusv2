@@ -21,12 +21,14 @@ export interface CPD {
   location?: string
   timezone: string
   active: boolean
-  temp_max?: number
-  temp_min?: number
-  humidity_max?: number
-  humidity_min?: number
+  temp_max?: number | null
+  temp_min?: number | null
+  humidity_max?: number | null
+  humidity_min?: number | null
   heartbeat_interval_sec: number
   heartbeat_timeout_sec: number
+  severity_warning_delta?: number | null
+  severity_critical_delta?: number | null
 }
 
 export interface Device {
@@ -43,6 +45,10 @@ export interface Device {
   status?: 'online' | 'offline'
   temperature?: number | null
   humidity?: number | null
+  temp_max?: number | null
+  temp_min?: number | null
+  humidity_max?: number | null
+  humidity_min?: number | null
   severity_warning_delta?: number | null
   severity_critical_delta?: number | null
 }
