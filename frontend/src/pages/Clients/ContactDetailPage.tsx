@@ -142,7 +142,7 @@ export default function ContactDetailPage() {
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
   const [showAddForm, setShowAddForm] = useState(false)
-  const [editingId, setEditingId] = useState<number | null>(null)
+  const [editingId, setEditingId] = useState<number | null>(-1)
 
   const [form, setForm] = useState({ name: '', whatsapp: '', email: '' })
 
@@ -174,7 +174,7 @@ export default function ContactDetailPage() {
   async function updateSub(subId: number, sub: Partial<AlertSubscription>) {
     await api.updateSubscription(Number(contactId), subId, sub)
     setContact(c => c ? { ...c, subscriptions: c.subscriptions.map(s => s.id === subId ? { ...s, ...sub } : s) } : c)
-    setEditingId(null)
+    setEditingId(-1)
   }
 
   async function deleteSub(subId: number) {
@@ -226,7 +226,7 @@ export default function ContactDetailPage() {
             <Bell className="w-4 h-4 text-gray-400" /> Inscrições de alerta
             <span className="text-xs bg-gray-800 rounded-full px-1.5 text-gray-400">{contact.subscriptions.length}</span>
           </h2>
-          <button onClick={() => { setShowAddForm(true); setEditingId(null) }}
+          <button onClick={() => { setShowAddForm(true); setEditingId(-1) }}
             className="flex items-center gap-1.5 text-sm bg-blue-600 hover:bg-blue-500 text-white px-3 py-1.5 rounded-lg">
             <Plus className="w-4 h-4" /> Adicionar
           </button>
@@ -249,7 +249,7 @@ export default function ContactDetailPage() {
                 return (
                   <SubForm key={s.id} cpds={cpds} initial={s} saveLabel="Salvar"
                     onSave={data => updateSub(s.id, data)}
-                    onCancel={() => setEditingId(null)} />
+                    onCancel={() => setEditingId(-1)} />
                 )
               }
 

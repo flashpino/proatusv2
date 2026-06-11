@@ -319,12 +319,12 @@ router.get('/contacts', auth, scopeToClient, async (req, res) => {
   const params      = clientId ? [clientId] : [];
   const [rows] = await mysqlPool.query(
     `SELECT c.*, GROUP_CONCAT(
-       JSON_OBJECT(
+       CASE WHEN s.id IS NOT NULL THEN JSON_OBJECT(
          'id', s.id, 'cpd_id', s.cpd_id, 'alert_type', s.alert_type,
          'channel', s.channel, 'time_from', s.time_from, 'time_to', s.time_to,
          'weekdays_mask', s.weekdays_mask, 'cooldown_minutes', s.cooldown_minutes,
          'severity_min', s.severity_min, 'active', s.active
-       )
+       ) END
      ) AS subscriptions_json
      FROM contacts c
      LEFT JOIN alert_subscriptions s ON s.contact_id = c.id
