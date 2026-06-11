@@ -42,9 +42,11 @@ function createBroker() {
         return callback(null, false);
       }
 
-      // Compara token com timing-safe para evitar timing attack
+      // O banco guarda SHA-256 do token; o device envia o token puro.
+      // Compara hashes com timing-safe para evitar timing attack.
+      const providedHash = crypto.createHash('sha256').update(token).digest('hex');
       const expected = Buffer.from(device.token, 'utf8');
-      const provided  = Buffer.from(token, 'utf8');
+      const provided = Buffer.from(providedHash, 'utf8');
       if (expected.length !== provided.length || !crypto.timingSafeEqual(expected, provided)) {
         logger.warn('MQTT: token inválido', { clientId: mqttClientId });
         return callback(null, false);
@@ -112,19 +114,24 @@ function createBroker() {
       temperature, humidity,
     });
 
-    // Atualiza last_seen
-    await deviceModel.updateLastSeen(device.device_id).catch(e =>
+    // Atualiza last_seen (ts = millis desde o boot → detecta reboot do ESP32)
+    await deviceModel.updateLastSeen(
+      device.device_id,
+      typeof data.rssi === 'number' ? data.rssi : null,
+      typeof data.ts === 'number' ? data.ts : null,
+    ).catch(e =>
       logger.error('MQTT: erro ao atualizar last_seen', { error: e.message }),
     );
 
-    // Grava no InfluxDB
+    // Grava no InfluxDB — ts do payload é millis() desde o boot, não
+    // timestamp absoluto; usa a hora de chegada
     await influxService.writeReading({
       deviceId:    device.device_id,
       cpdId:       device.cpd_id,
       clientId:    device.client_id,
       temperature,
       humidity,
-      timestamp:   data.ts ? new Date(data.ts) : new Date(),
+      timestamp:   new Date(),
     }).catch(e => logger.error('InfluxDB: erro ao gravar', { error: e.message }));
 
     // Motor de regras

@@ -2,10 +2,10 @@
 const cron          = require('node-cron');
 const deviceModel   = require('../models/device');
 const alertModel    = require('../models/alert');
-const webhookService = require('../services/webhook.service');
 const sseService    = require('../services/sse.service');
 const { mysqlPool } = require('../../config/database');
 const logger        = require('../utils/logger');
+const { notifySubscribers } = require('../services/alert.notifier');
 
 /**
  * Inicia o cron job de verificação de heartbeat.
@@ -31,7 +31,7 @@ async function checkHeartbeats() {
   logger.info(`Heartbeat: verificando ${devices.length} device(s)`);
 
   for (const device of devices) {
-    const { device_id, device_name, cpd_id, cpd_name, client_id, last_seen_at, heartbeat_timeout_sec } = device;
+    const { device_id, device_name, cpd_id, cpd_name, client_id, last_seen_at, heartbeat_timeout_sec, timezone } = device;
 
     if (!last_seen_at) {
       logger.info('Heartbeat: device sem last_seen_at, ignorando', { deviceId: device_id, deviceName: device_name });
@@ -61,13 +61,13 @@ async function checkHeartbeats() {
       sseService.broadcast('telemetry', { id: device_id, status: 'offline' }, client_id);
       await triggerCommFailure({ device, secondsSinceLastSeen });
     } else {
-      await resolveCommFailure(cpd_id, device_id, cpd_name, client_id);
+      await resolveCommFailure(cpd_id, device_id, cpd_name, client_id, timezone);
     }
   }
 }
 
 async function triggerCommFailure({ device, secondsSinceLastSeen }) {
-  const { device_id, cpd_id, cpd_name } = device;
+  const { device_id, device_name, cpd_id, cpd_name, timezone } = device;
 
   // Busca nome do cliente
   const [clientRows] = await mysqlPool.query(
@@ -76,12 +76,13 @@ async function triggerCommFailure({ device, secondsSinceLastSeen }) {
   );
   const clientName = clientRows[0]?.client_name || 'Desconhecido';
 
-  const message = `🔴 FALHA DE COMUNICAÇÃO\n[${clientName}] ${cpd_name}\nÚltimo sinal há ${Math.round(secondsSinceLastSeen / 60)} min`;
+  const message = `🔴 FALHA DE COMUNICAÇÃO\n[${clientName}] ${cpd_name} — sensor ${device_name}\nÚltimo sinal há ${Math.round(secondsSinceLastSeen / 60)} min`;
 
   // Reaproveita o evento aberto (se houver) em vez de abandonar a notificação.
   // Assim o reenvio passa a ser controlado pelo cooldown de cada contato
   // (findRecentDispatch), reavisando a cada `cooldown_minutes` enquanto offline.
-  const existing = await alertModel.findOpenEvent(cpd_id, 'comm_failure');
+  // Evento por device: outro sensor do mesmo CPD não interfere.
+  const existing = await alertModel.findOpenEvent(device_id, 'comm_failure');
   let eventId;
   if (existing) {
     eventId = existing.id;
@@ -99,77 +100,21 @@ async function triggerCommFailure({ device, secondsSinceLastSeen }) {
     logger.warn('Heartbeat: evento comm_failure criado', { eventId, cpdId: cpd_id, deviceId: device_id });
   }
 
-  // Busca subscriptions para comm_failure
-  const subscriptions = await alertModel.findEligibleSubscriptions(cpd_id, 'comm_failure', 'critical');
-
-  logger.info('Heartbeat: subscriptions elegíveis para comm_failure', {
-    cpdId: cpd_id,
-    total: subscriptions.length,
-    contacts: subscriptions.map(s => s.contact_name),
+  // Notifica via serviço unificado. Não registra 'suppressed' aqui:
+  // o cron roda a cada minuto e poluiria a tabela.
+  await notifySubscribers({
+    eventId, cpdId: cpd_id,
+    alertType: 'comm_failure',
+    severity:  'critical',
+    cpdName:   cpd_name,
+    clientName,
+    message,
+    timezone,
   });
-
-  if (!subscriptions.length) {
-    logger.warn('Heartbeat: nenhuma subscription encontrada para comm_failure — ninguém será notificado', { cpdId: cpd_id });
-    return;
-  }
-
-  for (const sub of subscriptions) {
-    const channel = sub.channel === 'both' ? 'whatsapp' : sub.channel;
-
-    // Ligação: dedup por alert_event (1x por episódio)
-    if (channel === 'call') {
-      const alreadyCalled = await alertModel.hasCallDispatch(eventId, sub.contact_id);
-      if (alreadyCalled) {
-        logger.info('Heartbeat: ligação já realizada neste evento', {
-          eventId, contactId: sub.contact_id,
-        });
-        continue;
-      }
-    } else {
-      const recent = await alertModel.findRecentDispatch(sub.contact_id, 'comm_failure', sub.cooldown_minutes);
-      if (recent) {
-        logger.info('Heartbeat: cooldown ativo para contato', { contactId: sub.contact_id, cooldown: sub.cooldown_minutes });
-        continue;
-      }
-    }
-
-    const destination = channel === 'email' ? sub.email : sub.whatsapp;
-    if (!destination) {
-      logger.warn('Heartbeat: contato sem número/email configurado', { contactId: sub.contact_id, contactName: sub.contact_name });
-      continue;
-    }
-
-    const dispatchId = await alertModel.createDispatch({
-      alertEventId:   eventId,
-      contactId:      sub.contact_id,
-      subscriptionId: sub.subscription_id,
-      channel,
-      destination,
-      status:         'pending',
-    });
-
-    logger.info('Heartbeat: disparando webhook comm_failure', {
-      dispatchId, contactName: sub.contact_name, channel, destination,
-    });
-
-    webhookService.send({
-      dispatchId,
-      channel,
-      destination,
-      alertType:   'comm_failure',
-      severity:    'critical',
-      value:       null,
-      threshold:   null,
-      cpdName:     cpd_name,
-      clientName,
-      contactName: sub.contact_name,
-      message,
-    }).catch(() => {});
-  }
 }
 
-async function resolveCommFailure(cpdId, deviceId, cpdName, clientId) {
-  const open = await alertModel.findOpenEvent(cpdId, 'comm_failure');
+async function resolveCommFailure(cpdId, deviceId, cpdName, clientId, timezone) {
+  const open = await alertModel.findOpenEvent(deviceId, 'comm_failure');
   if (!open) return;
 
   await alertModel.resolveEvent(open.id);
@@ -189,41 +134,15 @@ async function resolveCommFailure(cpdId, deviceId, cpdName, clientId) {
     severity: 'warning', value: null, threshold: null, message,
   });
 
-  // Usa subscriptions de comm_failure — quem quer saber da queda também quer saber do retorno
-  const subscriptions = await alertModel.findEligibleSubscriptions(cpdId, 'comm_failure', 'critical');
-  for (const sub of subscriptions) {
-    const destination = sub.channel === 'email' ? sub.email : sub.whatsapp;
-    if (!destination) continue;
-
-    const recent = await alertModel.findRecentDispatch(sub.contact_id, 'comm_restored', sub.cooldown_minutes);
-    if (recent) {
-      logger.info('Heartbeat: cooldown ativo para comm_restored', { contactId: sub.contact_id });
-      continue;
-    }
-
-    const dispatchId = await alertModel.createDispatch({
-      alertEventId:   eventId,
-      contactId:      sub.contact_id,
-      subscriptionId: sub.subscription_id,
-      channel:        sub.channel === 'both' ? 'whatsapp' : sub.channel,
-      destination,
-      status:         'pending',
-    });
-
-    webhookService.send({
-      dispatchId,
-      channel:     sub.channel === 'both' ? 'whatsapp' : sub.channel,
-      destination,
-      alertType:   'comm_restored',
-      severity:    'warning',
-      value:       null,
-      threshold:   null,
-      cpdName,
-      clientName,
-      contactName: sub.contact_name,
-      message,
-    }).catch(() => {});
-  }
+  // Inscritos de comm_failure recebem o retorno (não existe inscrição própria)
+  await notifySubscribers({
+    eventId, cpdId,
+    alertType:            'comm_restored',
+    subscriptionType:     'comm_failure',
+    severity:             'warning',
+    subscriptionSeverity: 'critical', // quem recebeu a queda recebe o retorno
+    cpdName, clientName, message, timezone,
+  });
 }
 
 module.exports = { start, checkHeartbeats };

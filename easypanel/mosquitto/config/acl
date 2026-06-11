@@ -1,0 +1,14 @@
+# ACL — CPD Monitor
+# Regras avaliadas por usuário autenticado (password_file).
+#
+# %u = username. Devices autenticam com username = mqtt_client_id,
+# então cada device só enxerga cpd/<seu-proprio-id>/...
+
+# Backend: acesso total à árvore cpd/
+user cpd-backend
+topic readwrite cpd/#
+
+# Devices: somente os próprios tópicos
+# (pattern aplica-se a todos os usuários, inclusive os que não têm
+#  seção "user" própria — o backend já foi liberado acima)
+pattern readwrite cpd/%u/#

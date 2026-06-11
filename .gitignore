@@ -5,3 +5,5 @@ backend/logs/
 backend/.env
 frontend/dist/
 .DS_Store
+backend/firmware/*.bin
+backend/firmware/manifest.json

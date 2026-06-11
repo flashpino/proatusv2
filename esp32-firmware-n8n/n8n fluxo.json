@@ -22,7 +22,7 @@
     },
     {
       "parameters": {
-        "jsCode": "// Valida o secret do webhook para garantir que veio do backend\nconst secret = $input.first().json.headers['x-webhook-secret'];\nconst expected = \"wuY1AfWhA283UKibufmp2qZHokZ4Xm6Z\";\n\nif (!secret || secret !== expected) {\n  throw new Error('Webhook secret inválido — requisição rejeitada');\n}\n\n// Extrai e normaliza o payload\nconst body = $input.first().json.body;\n\nreturn [{\n  json: {\n    dispatch_id:  body.dispatch_id,\n    channel:      body.channel,\n    destination:  body.destination,\n    alert_type:   body.alert_type,\n    severity:     body.severity,\n    value:        body.value,\n    threshold:    body.threshold,\n    cpd_name:     body.cpd_name,\n    client_name:  body.client_name,\n    contact_name: body.contact_name,\n    message:      body.message,\n    timestamp:    body.timestamp,\n  }\n}];"
+        "jsCode": "// Valida o secret do webhook para garantir que veio do backend.\n// Configure CPD_WEBHOOK_SECRET nas variáveis de ambiente do n8n\n// (mesmo valor de N8N_WEBHOOK_SECRET no backend). NUNCA hardcode aqui.\nconst secret   = $input.first().json.headers['x-webhook-secret'];\nconst expected = $env.CPD_WEBHOOK_SECRET;\n\nif (!expected) {\n  throw new Error('CPD_WEBHOOK_SECRET não configurado no ambiente do n8n');\n}\nif (!secret || secret !== expected) {\n  throw new Error('Webhook secret inválido — requisição rejeitada');\n}\n\n// Extrai e normaliza o payload\nconst body = $input.first().json.body;\n\nreturn [{\n  json: {\n    dispatch_id:  body.dispatch_id,\n    channel:      body.channel,\n    destination:  body.destination,\n    alert_type:   body.alert_type,\n    severity:     body.severity,\n    value:        body.value,\n    threshold:    body.threshold,\n    cpd_name:     body.cpd_name,\n    client_name:  body.client_name,\n    contact_name: body.contact_name,\n    message:      body.message,\n    timestamp:    body.timestamp,\n  }\n}];"
       },
       "id": "ad130034-8f47-4983-b380-936d8da291bf",
       "name": "Valida e extrai payload",
@@ -129,6 +129,7 @@
       },
       "type": "n8n-nodes-evolution-api.evolutionApi",
       "typeVersion": 1,
+      "onError": "continueErrorOutput",
       "position": [
         240,
         -16
@@ -145,7 +146,7 @@
     {
       "parameters": {
         "method": "POST",
-        "url": "https://api.twilio.com/2010-04-01/Accounts/YOUR_TWILIO_ACCOUNT_SID/Calls.json",
+        "url": "=https://api.twilio.com/2010-04-01/Accounts/{{ $env.TWILIO_ACCOUNT_SID }}/Calls.json",
         "authentication": "genericCredentialType",
         "genericAuthType": "httpBasicAuth",
         "sendBody": true,
@@ -162,7 +163,7 @@
             },
             {
               "name": "Twiml",
-              "value": "=<Response><Say language=\"pt-BR\" voice=\"Google.pt-BR-Chirp3-HD-Charon\">\n   <break time=\"1s\"/>\nAtenção!\n    <break time=\"1s\"/>\nVerifique o sistema de climatização do {{ $('Webhook — Recebe alerta').item.json.body.cpd_name }}, a temperatura está em {{ $('Webhook — Recebe alerta').item.json.body.value }} graus\n</Say></Response>"
+              "value": "=<Response><Say language=\"pt-BR\" voice=\"Google.pt-BR-Chirp3-HD-Charon\"><break time=\"1s\"/>Atenção! <break time=\"1s\"/>{{ $('Valida e extrai payload').item.json.message.replace(/[^\\p{L}\\p{N}\\s.,:;!?°%()\\-]/gu, ' ').replace(/\\s+/g, ' ').trim() }} <break time=\"1s\"/>Repetindo: {{ $('Valida e extrai payload').item.json.message.replace(/[^\\p{L}\\p{N}\\s.,:;!?°%()\\-]/gu, ' ').replace(/\\s+/g, ' ').trim() }}</Say></Response>"
             },
             {
               "name": "StatusCallback",
@@ -198,6 +199,7 @@
       },
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.4,
+      "onError": "continueErrorOutput",
       "position": [
         -32,
         336
@@ -303,34 +305,7 @@
       "name": "Switch"
     }
   ],
-  "pinData": {
-    "Webhook — Recebe alerta": [
-      {
-        "json": {
-          "headers": {
-            "x-webhook-secret": "wuY1AfWhA283UKibufmp2qZHokZ4Xm6Z",
-            "content-type": "application/json"
-          },
-          "params": {},
-          "query": {},
-          "body": {
-            "dispatch_id": 100,
-            "channel": "whatsapp",
-            "destination": "5511999999999",
-            "alert_type": "temp_high",
-            "severity": "critical",
-            "value": 32.5,
-            "threshold": 27,
-            "cpd_name": "CPD Principal",
-            "client_name": "Proatus TI",
-            "contact_name": "Anderson",
-            "message": "Temperatura alta detectada no rack central!",
-            "timestamp": "2026-06-03T17:25:00.000Z"
-          }
-        }
-      }
-    ]
-  },
+  "pinData": {},
   "connections": {
     "Webhook — Recebe alerta": {
       "main": [
@@ -406,6 +381,13 @@
             "type": "main",
             "index": 0
           }
+        ],
+        [
+          {
+            "node": "Responde 500",
+            "type": "main",
+            "index": 0
+          }
         ]
       ]
     },
@@ -444,6 +426,13 @@
         [
           {
             "node": "Responde 200 OK",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Responde 500",
             "type": "main",
             "index": 0
           }

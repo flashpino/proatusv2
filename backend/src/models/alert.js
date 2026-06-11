@@ -25,15 +25,16 @@ async function resolveEvent(eventId) {
 }
 
 /**
- * Busca o alert_event aberto mais recente para um CPD + tipo.
- * Usado para detectar se já há um evento ativo e evitar duplicatas.
+ * Busca o alert_event aberto mais recente para um DEVICE + tipo.
+ * Eventos são por device: num CPD com vários sensores, a leitura normal
+ * do sensor A não pode resolver (nem deduplicar) o alerta do sensor B.
  */
-async function findOpenEvent(cpdId, alertType) {
+async function findOpenEvent(deviceId, alertType) {
   const [rows] = await mysqlPool.query(
     `SELECT id, triggered_at FROM alert_events
-     WHERE cpd_id = ? AND alert_type = ? AND resolved_at IS NULL
+     WHERE device_id = ? AND alert_type = ? AND resolved_at IS NULL
      ORDER BY triggered_at DESC LIMIT 1`,
-    [cpdId, alertType],
+    [deviceId, alertType],
   );
   return rows[0] || null;
 }
@@ -85,8 +86,10 @@ async function hasCallDispatch(alertEventId, contactId) {
 }
 
 /**
- * Retorna o último dispatch ENVIADO para um contato + tipo de alerta
- * dentro do período de cooldown. Usado para suprimir envios repetidos.
+ * Retorna o último dispatch para um contato + tipo de alerta dentro do
+ * período de cooldown. Conta 'sent' e 'pending' (em trânsito na fila/retry),
+ * mas NÃO 'failed': uma falha de envio não pode silenciar o alerta pelo
+ * cooldown inteiro — o worker de retry cuida do reenvio.
  */
 async function findRecentDispatch(contactId, alertType, cooldownMinutes) {
   const [rows] = await mysqlPool.query(
@@ -95,13 +98,61 @@ async function findRecentDispatch(contactId, alertType, cooldownMinutes) {
      JOIN alert_events     e ON e.id = d.alert_event_id
      WHERE d.contact_id = ?
        AND e.alert_type = ?
-       AND d.status     IN ('sent', 'failed', 'pending')
+       AND d.status     IN ('sent', 'pending')
        AND d.dispatched_at >= DATE_SUB(NOW(), INTERVAL ? MINUTE)
      ORDER BY d.dispatched_at DESC
      LIMIT 1`,
     [contactId, alertType, cooldownMinutes],
   );
   return rows[0] || null;
+}
+
+/**
+ * Dispatches que precisam de reenvio pelo worker de retry:
+ * - 'failed' com menos de maxAttempts tentativas, respeitando backoff
+ *   exponencial (2^attempts minutos desde a última tentativa);
+ * - 'pending' órfãos (criados há mais de 10 min — fila perdida em restart).
+ * Retorna tudo que o webhook precisa para remontar o payload.
+ */
+async function findRetryableDispatches(maxAttempts = 5) {
+  const [rows] = await mysqlPool.query(
+    `SELECT
+       d.id            AS dispatch_id,
+       d.channel, d.destination, d.attempts, d.status,
+       e.alert_type, e.severity, e.value, e.threshold, e.message,
+       c.name          AS cpd_name,
+       cl.name         AS client_name,
+       con.name        AS contact_name
+     FROM alert_dispatches d
+     JOIN alert_events e   ON e.id  = d.alert_event_id
+     JOIN cpds c           ON c.id  = e.cpd_id
+     JOIN clients cl       ON cl.id = c.client_id
+     JOIN contacts con     ON con.id = d.contact_id
+     WHERE (
+         (d.status = 'failed'
+           AND d.attempts < ?
+           AND d.dispatched_at <= DATE_SUB(NOW(), INTERVAL POW(2, d.attempts) MINUTE))
+      OR (d.status = 'pending'
+           AND d.dispatched_at <= DATE_SUB(NOW(), INTERVAL 10 MINUTE))
+     )
+     ORDER BY d.dispatched_at ASC
+     LIMIT 20`,
+    [maxAttempts],
+  );
+  return rows;
+}
+
+/**
+ * Registra uma tentativa de envio: incrementa attempts e atualiza o
+ * timestamp de despacho (base do backoff do retry).
+ */
+async function markDispatchAttempt(dispatchId) {
+  await mysqlPool.query(
+    `UPDATE alert_dispatches
+     SET attempts = attempts + 1, dispatched_at = NOW(), status = 'pending'
+     WHERE id = ?`,
+    [dispatchId],
+  );
 }
 
 /**
@@ -150,6 +201,8 @@ module.exports = {
   createDispatch,
   updateDispatch,
   findRecentDispatch,
+  findRetryableDispatches,
+  markDispatchAttempt,
   hasCallDispatch,
   findEligibleSubscriptions,
 };

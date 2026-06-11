@@ -9,8 +9,9 @@ const cors      = require('cors');
 const rateLimit = require('express-rate-limit');
 
 const logger              = require('./utils/logger');
-const { testMySQL, testInflux } = require('../config/database');
+const { mysqlPool, testMySQL, testInflux, closeInflux } = require('../config/database');
 const heartbeat           = require('./rules/heartbeat');
+const dispatchRetry       = require('./services/dispatch.retry');
 const apiRoutes           = require('./api/routes/index');
 
 // Pasta de logs
@@ -42,7 +43,32 @@ async function bootstrap() {
   }));
 
   app.use('/api', apiRoutes);
-  app.get('/health', (_, res) => res.json({ status: 'ok', ts: new Date() }));
+
+  // Healthcheck real: verifica MySQL e a conexão MQTT (quando em modo
+  // Mosquitto externo). Retorna 503 se algo crítico está fora — assim o
+  // orquestrador (EasyPanel/Docker) e o monitor externo enxergam a falha.
+  app.get('/health', async (_, res) => {
+    const checks = { mysql: false, mqtt: null };
+    try {
+      const conn = await mysqlPool.getConnection();
+      await conn.ping();
+      conn.release();
+      checks.mysql = true;
+    } catch { /* mysql down */ }
+
+    if (process.env.MQTT_BROKER_HOST) {
+      try {
+        checks.mqtt = require('./mqtt/client').isConnected();
+      } catch { checks.mqtt = false; }
+    }
+
+    const healthy = checks.mysql && checks.mqtt !== false;
+    res.status(healthy ? 200 : 503).json({
+      status: healthy ? 'ok' : 'degraded',
+      ...checks,
+      ts: new Date(),
+    });
+  });
 
   // Captura erros de async route handlers que não usam try/catch
   // (Express 4 não faz isso automaticamente)
@@ -56,7 +82,22 @@ async function bootstrap() {
   });
 
   const PORT = parseInt(process.env.PORT) || 3001;
-  app.listen(PORT, () => logger.info(`API REST na porta ${PORT}`));
+  const server = app.listen(PORT, () => logger.info(`API REST na porta ${PORT}`));
+
+  // Shutdown gracioso: para de aceitar requisições, descarrega o buffer do
+  // InfluxDB e fecha o pool MySQL antes de sair (deploys não perdem dados).
+  let shuttingDown = false;
+  async function shutdown(signal) {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    logger.info(`${signal} recebido — encerrando graciosamente...`);
+    server.close();
+    await closeInflux();
+    await mysqlPool.end().catch(() => {});
+    process.exit(0);
+  }
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGINT',  () => shutdown('SIGINT'));
 
   // ── MQTT: Mosquitto externo ou Aedes embutido ─────────────
   if (process.env.MQTT_BROKER_HOST) {
@@ -71,6 +112,9 @@ async function bootstrap() {
 
   // ── Heartbeat checker ─────────────────────────────────────
   heartbeat.start();
+
+  // ── Retry de notificações (failed + pending órfãos) ──────
+  dispatchRetry.start();
 
   logger.info('CPD Monitor iniciado ✓');
 }

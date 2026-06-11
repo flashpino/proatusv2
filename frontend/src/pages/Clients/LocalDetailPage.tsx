@@ -120,6 +120,8 @@ export default function LocalDetailPage() {
   const [loading, setLoading] = useState(true)
   const [showProvision, setShowProvision] = useState(false)
   const [cfgSaving, setCfgSaving] = useState(false)
+  const [name, setName] = useState('')
+  const [location, setLocation] = useState('')
   const [wDelta, setWDelta] = useState('')
   const [cDelta, setCDelta] = useState('')
 
@@ -140,6 +142,8 @@ export default function LocalDetailPage() {
       loadDevices(),
     ]).then(([l]) => {
       setLocal(l)
+      setName(l.name ?? '')
+      setLocation(l.location ?? '')
       setWDelta(l.severity_warning_delta?.toString() ?? '')
       setCDelta(l.severity_critical_delta?.toString() ?? '')
     }).finally(() => setLoading(false))
@@ -258,11 +262,28 @@ export default function LocalDetailPage() {
           setCfgSaving(true)
           try {
             await api.updateCPD(id, {
+              name,
+              location: location || null,
               severity_warning_delta:  wDelta !== '' ? Number(wDelta) : null,
               severity_critical_delta: cDelta !== '' ? Number(cDelta) : null,
             })
+            setLocal(l => l ? { ...l, name, location } : l)
           } finally { setCfgSaving(false) }
         }} className="space-y-5 max-w-lg">
+
+          <div className="bg-gray-900 border border-gray-800 rounded-xl p-5 space-y-4">
+            <h3 className="text-sm font-semibold text-white">Dados do local</h3>
+            <div>
+              <label className="text-xs text-gray-400 block mb-1">Nome</label>
+              <input value={name} onChange={e => setName(e.target.value)} placeholder="ex: CPD Principal"
+                className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-white placeholder-gray-600 focus:outline-none focus:border-blue-500" />
+            </div>
+            <div>
+              <label className="text-xs text-gray-400 block mb-1">Localização</label>
+              <input value={location} onChange={e => setLocation(e.target.value)} placeholder="ex: 2º andar, sala 204"
+                className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-white placeholder-gray-600 focus:outline-none focus:border-blue-500" />
+            </div>
+          </div>
 
           <div className="bg-gray-900 border border-gray-800 rounded-xl p-5 space-y-4">
             <div>

@@ -5,7 +5,7 @@ const logger = require('../utils/logger');
 
 async function writeReading({ deviceId, cpdId, clientId, temperature, humidity, timestamp }) {
   const hi = heatIndex(temperature, humidity);
-  const writeApi = getWriteApi();
+  const writeApi = getWriteApi(); // singleton com batch/retry — não fechar aqui
 
   const point = new Point('sensor_readings')
     .tag('device_id', String(deviceId))
@@ -18,9 +18,36 @@ async function writeReading({ deviceId, cpdId, clientId, temperature, humidity, 
   if (timestamp)   point.timestamp(new Date(timestamp));
 
   writeApi.writePoint(point);
-  await writeApi.close();
 
-  logger.debug('InfluxDB: leitura gravada', { deviceId, cpdId, temperature, humidity });
+  logger.debug('InfluxDB: leitura enfileirada', { deviceId, cpdId, temperature, humidity });
+}
+
+/**
+ * Última leitura de CADA device em uma única query (dashboard /telemetry).
+ * Retorna { [device_id]: { temperature, humidity, time } }.
+ */
+async function getLatestReadingsByDevice(maxAgeMinutes = 10) {
+  const queryApi = getQueryApi();
+  const bucket   = process.env.INFLUX_BUCKET;
+
+  const query = `
+    from(bucket: "${bucket}")
+      |> range(start: -${parseInt(maxAgeMinutes)}m)
+      |> filter(fn: (r) => r._measurement == "sensor_readings")
+      |> filter(fn: (r) => r._field == "temperature" or r._field == "humidity")
+      |> group(columns: ["device_id", "_field"])
+      |> last()
+  `;
+
+  const rows = await collectRows(queryApi, query);
+  const byDevice = {};
+  for (const r of rows) {
+    const id = r.device_id;
+    if (!byDevice[id]) byDevice[id] = {};
+    byDevice[id][r._field] = r._value;
+    byDevice[id].time = r._time;
+  }
+  return byDevice;
 }
 
 async function getLastReadings(cpdId, limit = 60) {
@@ -90,4 +117,4 @@ function heatIndex(tempC, humidity) {
   return parseFloat(((HI - 32) * 5 / 9).toFixed(2));
 }
 
-module.exports = { writeReading, getLastReadings, getReadingsByRange };
+module.exports = { writeReading, getLastReadings, getReadingsByRange, getLatestReadingsByDevice };

@@ -32,15 +32,24 @@ async function findByMqttClientId(mqttClientId) {
 
 /**
  * Atualiza o last_seen_at do device.
+ * `uptimeMs` é o campo `ts` do payload (millis() desde o boot do ESP32).
+ * O instante do boot é NOW() - uptime; se ele for mais recente que o
+ * connected_since atual, o device reiniciou e o connected_since avança.
+ * Obs: millis() estoura em ~49,7 dias — após o rollover o uptime reinicia.
  */
-async function updateLastSeen(deviceId, rssi = null) {
+async function updateLastSeen(deviceId, rssi = null, uptimeMs = null, fw = null) {
+  const uptimeSec = Number.isFinite(uptimeMs) ? Math.floor(uptimeMs / 1000) : null;
   await mysqlPool.query(
     `UPDATE devices SET
-       last_seen_at    = NOW(),
-       last_rssi       = COALESCE(?, last_rssi),
-       connected_since = COALESCE(connected_since, NOW())
+       last_seen_at     = NOW(),
+       last_rssi        = COALESCE(?, last_rssi),
+       firmware_version = COALESCE(?, firmware_version),
+       connected_since  = CASE
+         WHEN ? IS NULL THEN COALESCE(connected_since, NOW())
+         ELSE GREATEST(COALESCE(connected_since, NOW() - INTERVAL ? SECOND), NOW() - INTERVAL ? SECOND)
+       END
      WHERE id = ?`,
-    [rssi, deviceId],
+    [rssi, fw, uptimeSec, uptimeSec, uptimeSec, deviceId],
   );
 }
 
@@ -64,6 +73,7 @@ async function findAllActiveWithCpd() {
        c.id              AS cpd_id,
        c.name            AS cpd_name,
        c.client_id,
+       c.timezone,
        c.heartbeat_timeout_sec
      FROM devices d
      JOIN cpds    c  ON c.id  = d.cpd_id

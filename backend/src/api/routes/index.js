@@ -26,6 +26,53 @@ const router = (() => {
 const auth = authMiddleware;
 
 // ============================================================
+// ESCOPO MULTI-TENANT
+// superadmin acessa tudo; admin/viewer só recursos do próprio client_id.
+// Responde 404 (e não 403) para não revelar a existência do recurso.
+// ============================================================
+
+async function cpdInScope(req, cpdId) {
+  if (req.user.role === 'superadmin') return true;
+  const [r] = await mysqlPool.query(
+    'SELECT 1 FROM cpds WHERE id = ? AND client_id = ?',
+    [cpdId, req.user.client_id],
+  );
+  return r.length > 0;
+}
+
+async function deviceInScope(req, deviceId) {
+  if (req.user.role === 'superadmin') return true;
+  const [r] = await mysqlPool.query(
+    `SELECT 1 FROM devices d JOIN cpds c ON c.id = d.cpd_id
+     WHERE d.id = ? AND c.client_id = ?`,
+    [deviceId, req.user.client_id],
+  );
+  return r.length > 0;
+}
+
+async function contactInScope(req, contactId) {
+  if (req.user.role === 'superadmin') return true;
+  const [r] = await mysqlPool.query(
+    'SELECT 1 FROM contacts WHERE id = ? AND client_id = ?',
+    [contactId, req.user.client_id],
+  );
+  return r.length > 0;
+}
+
+const notFound = (res) => res.status(404).json({ error: 'Recurso não encontrado' });
+
+// Sanitização: IDs de rota usados em queries Flux (string interpolation)
+// precisam ser estritamente numéricos.
+const isId = (v) => /^\d+$/.test(String(v));
+
+// parseInt com default e limites — evita NaN/abuso em LIMIT
+function intParam(v, def, min, max) {
+  const n = parseInt(v);
+  if (Number.isNaN(n)) return def;
+  return Math.min(Math.max(n, min), max);
+}
+
+// ============================================================
 // AUTH
 // ============================================================
 
@@ -136,6 +183,7 @@ router.get('/cpds/:id', auth, scopeToClient, async (req, res) => {
 });
 
 router.put('/cpds/:id', auth, requireRole('superadmin','admin'), async (req, res) => {
+  if (!await cpdInScope(req, req.params.id)) return notFound(res);
   const fields = ['name','location','timezone','active',
     'temp_max','temp_min','humidity_max','humidity_min',
     'heartbeat_interval_sec','heartbeat_timeout_sec',
@@ -155,6 +203,7 @@ router.put('/cpds/:id', auth, requireRole('superadmin','admin'), async (req, res
 });
 
 router.delete('/cpds/:id', auth, requireRole('superadmin','admin'), async (req, res) => {
+  if (!await cpdInScope(req, req.params.id)) return notFound(res);
   await mysqlPool.query('UPDATE cpds SET active = 0 WHERE id = ?', [req.params.id]);
   res.json({ ok: true });
 });
@@ -214,6 +263,7 @@ router.get('/devices', auth, scopeToClient, async (req, res) => {
 });
 
 router.put('/devices/:id', auth, requireRole('superadmin','admin'), async (req, res) => {
+  if (!await deviceInScope(req, req.params.id)) return notFound(res);
   const fields = ['name','active','temp_max','temp_min','humidity_max','humidity_min'];
   const updates = Object.fromEntries(
     Object.entries(req.body).filter(([k]) => fields.includes(k)),
@@ -230,11 +280,13 @@ router.put('/devices/:id', auth, requireRole('superadmin','admin'), async (req, 
 });
 
 router.delete('/devices/:id', auth, requireRole('superadmin','admin'), async (req, res) => {
+  if (!await deviceInScope(req, req.params.id)) return notFound(res);
   await mysqlPool.query('UPDATE devices SET active = 0 WHERE id = ?', [req.params.id]);
   res.json({ ok: true });
 });
 
 router.post('/cpds/:cpdId/devices', auth, requireRole('superadmin','admin'), async (req, res) => {
+  if (!await cpdInScope(req, req.params.cpdId)) return notFound(res);
   const crypto = require('crypto');
   const { name } = req.body;
   if (!name) return res.status(400).json({ error: 'name obrigatório' });
@@ -291,6 +343,7 @@ router.get('/contacts', auth, scopeToClient, async (req, res) => {
 });
 
 router.put('/contacts/:id', auth, requireRole('superadmin','admin'), async (req, res) => {
+  if (!await contactInScope(req, req.params.id)) return notFound(res);
   const { name, whatsapp, email, active } = req.body;
   await mysqlPool.query(
     `UPDATE contacts SET
@@ -305,6 +358,7 @@ router.put('/contacts/:id', auth, requireRole('superadmin','admin'), async (req,
 });
 
 router.delete('/contacts/:id', auth, requireRole('superadmin','admin'), async (req, res) => {
+  if (!await contactInScope(req, req.params.id)) return notFound(res);
   await mysqlPool.query('UPDATE contacts SET active = 0 WHERE id = ?', [req.params.id]);
   res.json({ ok: true });
 });
@@ -353,8 +407,11 @@ router.post('/contacts', auth, requireRole('superadmin','admin'), async (req, re
 // ============================================================
 
 router.post('/contacts/:contactId/subscriptions', auth, requireRole('superadmin','admin'), async (req, res) => {
+  if (!await contactInScope(req, req.params.contactId)) return notFound(res);
   const { cpd_id, alert_type, channel, time_from, time_to,
           weekdays_mask, cooldown_minutes, severity_min } = req.body;
+  // cpd_id da inscrição (se houver) também precisa pertencer ao cliente
+  if (cpd_id && !await cpdInScope(req, cpd_id)) return notFound(res);
   const [result] = await mysqlPool.query(
     `INSERT INTO alert_subscriptions
        (contact_id, cpd_id, alert_type, channel, time_from, time_to,
@@ -382,9 +439,11 @@ router.post('/contacts/:contactId/subscriptions', auth, requireRole('superadmin'
 });
 
 router.put('/contacts/:contactId/subscriptions/:subId', auth, requireRole('superadmin','admin'), async (req, res) => {
+  if (!await contactInScope(req, req.params.contactId)) return notFound(res);
   const fields = ['cpd_id','alert_type','channel','time_from','time_to','weekdays_mask','cooldown_minutes','severity_min','active'];
   const updates = Object.fromEntries(Object.entries(req.body).filter(([k]) => fields.includes(k)));
   if (!Object.keys(updates).length) return res.status(400).json({ error: 'Nenhum campo válido' });
+  if (updates.cpd_id && !await cpdInScope(req, updates.cpd_id)) return notFound(res);
   const set = Object.keys(updates).map(k => `${k} = ?`).join(', ');
   await mysqlPool.query(
     `UPDATE alert_subscriptions SET ${set} WHERE id = ? AND contact_id = ?`,
@@ -394,6 +453,7 @@ router.put('/contacts/:contactId/subscriptions/:subId', auth, requireRole('super
 });
 
 router.delete('/contacts/:contactId/subscriptions/:subId', auth, requireRole('superadmin','admin'), async (req, res) => {
+  if (!await contactInScope(req, req.params.contactId)) return notFound(res);
   await mysqlPool.query(
     'DELETE FROM alert_subscriptions WHERE id = ? AND contact_id = ?',
     [req.params.subId, req.params.contactId],
@@ -406,14 +466,23 @@ router.delete('/contacts/:contactId/subscriptions/:subId', auth, requireRole('su
 // ============================================================
 
 router.get('/devices/:deviceId/readings', auth, scopeToClient, async (req, res) => {
-  const { limit = 60, from, to } = req.query;
+  // deviceId vai interpolado na query Flux: precisa ser numérico e do cliente
+  if (!isId(req.params.deviceId)) return notFound(res);
+  if (!await deviceInScope(req, req.params.deviceId)) return notFound(res);
+
+  const limit  = intParam(req.query.limit, 60, 1, 1440);
+  const { from, to } = req.query;
   const bucket = process.env.INFLUX_BUCKET;
   const { getQueryApi } = require('../../../config/database');
   const queryApi = getQueryApi();
 
-  const timeRange = (from && to)
-    ? `range(start: ${new Date(from).toISOString()}, stop: ${new Date(to).toISOString()})`
-    : `range(start: -${limit}m)`;
+  let timeRange = `range(start: -${limit}m)`;
+  if (from && to) {
+    const f = new Date(from), t = new Date(to);
+    if (Number.isNaN(f.getTime()) || Number.isNaN(t.getTime()))
+      return res.status(400).json({ error: 'from/to inválidos' });
+    timeRange = `range(start: ${f.toISOString()}, stop: ${t.toISOString()})`;
+  }
 
   const query = `
     from(bucket: "${bucket}")
@@ -424,7 +493,7 @@ router.get('/devices/:deviceId/readings', auth, scopeToClient, async (req, res) 
       |> aggregateWindow(every: 1m, fn: mean, createEmpty: false)
       |> pivot(rowKey:["_time"], columnKey: ["_field"], valueColumn: "_value")
       |> sort(columns: ["_time"], desc: true)
-      |> limit(n: ${parseInt(limit)})
+      |> limit(n: ${limit})
   `;
 
   const rows = await new Promise((resolve, reject) => {
@@ -439,15 +508,16 @@ router.get('/devices/:deviceId/readings', auth, scopeToClient, async (req, res) 
 });
 
 router.get('/devices/:deviceId/alerts', auth, scopeToClient, async (req, res) => {
-  const { limit = 50, open_only } = req.query;
+  if (!await deviceInScope(req, req.params.deviceId)) return notFound(res);
+  const limit = intParam(req.query.limit, 50, 1, 500);
   const [rows] = await mysqlPool.query(
     `SELECT id, alert_type, severity, value, threshold, message, triggered_at, resolved_at
      FROM alert_events
      WHERE device_id = ?
-       ${open_only === '1' ? 'AND resolved_at IS NULL' : ''}
+       ${req.query.open_only === '1' ? 'AND resolved_at IS NULL' : ''}
      ORDER BY triggered_at DESC
      LIMIT ?`,
-    [req.params.deviceId, parseInt(limit)],
+    [req.params.deviceId, limit],
   );
   res.json(rows);
 });
@@ -457,13 +527,17 @@ router.get('/devices/:deviceId/alerts', auth, scopeToClient, async (req, res) =>
 // ============================================================
 
 router.get('/cpds/:cpdId/readings', auth, scopeToClient, async (req, res) => {
-  const { limit = 60, from, to } = req.query;
+  if (!isId(req.params.cpdId)) return notFound(res);
+  if (!await cpdInScope(req, req.params.cpdId)) return notFound(res);
+  const limit = intParam(req.query.limit, 60, 1, 1440);
+  const { from, to } = req.query;
 
   let readings;
   if (from && to) {
-    readings = await influxService.getReadingsByRange(
-      req.params.cpdId, new Date(from), new Date(to),
-    );
+    const f = new Date(from), t = new Date(to);
+    if (Number.isNaN(f.getTime()) || Number.isNaN(t.getTime()))
+      return res.status(400).json({ error: 'from/to inválidos' });
+    readings = await influxService.getReadingsByRange(req.params.cpdId, f, t);
   } else {
     readings = await influxService.getLastReadings(req.params.cpdId, limit);
   }
@@ -475,16 +549,17 @@ router.get('/cpds/:cpdId/readings', auth, scopeToClient, async (req, res) => {
 // ============================================================
 
 router.get('/cpds/:cpdId/alerts', auth, scopeToClient, async (req, res) => {
-  const { limit = 50, open_only } = req.query;
+  if (!await cpdInScope(req, req.params.cpdId)) return notFound(res);
+  const limit = intParam(req.query.limit, 50, 1, 500);
   const [rows] = await mysqlPool.query(
     `SELECT id, alert_type, severity, value, threshold, message,
             triggered_at, resolved_at
      FROM alert_events
      WHERE cpd_id = ?
-       ${open_only === '1' ? 'AND resolved_at IS NULL' : ''}
+       ${req.query.open_only === '1' ? 'AND resolved_at IS NULL' : ''}
      ORDER BY triggered_at DESC
      LIMIT ?`,
-    [req.params.cpdId, parseInt(limit)],
+    [req.params.cpdId, limit],
   );
   res.json(rows);
 });
@@ -526,36 +601,41 @@ router.get('/telemetry', auth, scopeToClient, async (req, res) => {
   const clientId = req.clientScope;
   const [devices] = await mysqlPool.query(
     `SELECT d.id, d.mqtt_client_id, d.last_seen_at, d.last_rssi,
-            d.connected_since, d.cpd_id,
-            c.client_id, c.name AS cpd_name, cl.name AS client_name,
-            COALESCE(c.temp_max, cl.default_temp_max)         AS temp_max,
-            COALESCE(c.temp_min, cl.default_temp_min)         AS temp_min,
-            COALESCE(c.humidity_max, cl.default_humidity_max) AS humidity_max,
-            COALESCE(c.humidity_min, cl.default_humidity_min) AS humidity_min
+            d.connected_since, d.cpd_id, d.name AS device_name,
+            c.client_id, c.name AS cpd_name, c.heartbeat_timeout_sec,
+            cl.name AS client_name,
+            COALESCE(d.temp_max, c.temp_max, cl.default_temp_max)             AS temp_max,
+            COALESCE(d.temp_min, c.temp_min, cl.default_temp_min)             AS temp_min,
+            COALESCE(d.humidity_max, c.humidity_max, cl.default_humidity_max) AS humidity_max,
+            COALESCE(d.humidity_min, c.humidity_min, cl.default_humidity_min) AS humidity_min
      FROM devices d
      JOIN cpds c ON c.id = d.cpd_id
      JOIN clients cl ON cl.id = c.client_id
      WHERE d.active = 1 AND c.active = 1 ${clientId ? 'AND c.client_id = ?' : ''}
-     ORDER BY cl.name, c.name`,
+     ORDER BY cl.name, c.name, d.name`,
     clientId ? [clientId] : [],
   );
 
-  // Para cada device busca a última leitura no InfluxDB
-  const cutoff5m = new Date(Date.now() - 5 * 60 * 1000);
-  const results  = await Promise.all(devices.map(async d => {
-    const readings = await influxService.getLastReadings(d.cpd_id, 6); // últimos 6 min
-    const latest   = readings[0] || null;
-    const isOnline = d.last_seen_at && new Date(d.last_seen_at) > cutoff5m;
+  // Uma única query Influx: última leitura de cada device
+  const latestByDevice = await influxService.getLatestReadingsByDevice(10)
+    .catch(() => ({})); // Influx fora não derruba o dashboard
+
+  const now = Date.now();
+  const results = devices.map(d => {
+    const latest   = latestByDevice[String(d.id)] || {};
+    // online = visto dentro do timeout de heartbeat do CPD (mesma régua do alerta)
+    const isOnline = d.last_seen_at &&
+      (now - new Date(d.last_seen_at).getTime()) / 1000 <= (d.heartbeat_timeout_sec || 180);
     return {
       ...d,
       status:          isOnline ? 'online' : 'offline',
-      temperature:     latest?.temperature ?? null,
-      humidity:        latest?.humidity ?? null,
+      temperature:     latest.temperature ?? null,
+      humidity:        latest.humidity ?? null,
       last_seen_at:    d.last_seen_at,
       rssi:            d.last_rssi ?? null,
       connected_since: d.connected_since ?? null,
     };
-  }));
+  });
 
   res.json(results);
 });
@@ -612,23 +692,89 @@ router.get('/sse', async (req, res) => {
 });
 
 // ============================================================
-// DEBUG (apenas admin)
+// FIRMWARE OTA (autenticação por token de device, não JWT)
+// O ESP32 consulta o manifest periodicamente e baixa o binário
+// quando a versão difere da que está rodando.
+// ============================================================
+
+const fwCrypto = require('crypto');
+const fwFs     = require('fs');
+const fwPath   = require('path');
+const FIRMWARE_DIR = fwPath.join(__dirname, '../../../firmware');
+
+/** Autentica device por headers x-device-id (mqtt_client_id) + x-device-token. */
+async function deviceAuth(req, res, next) {
+  try {
+    const id    = req.headers['x-device-id'];
+    const token = req.headers['x-device-token'];
+    if (!id || !token) return res.status(401).json({ error: 'credenciais de device obrigatórias' });
+
+    const [rows] = await mysqlPool.query(
+      `SELECT d.id, d.token, d.active, c.active AS cpd_active, cl.active AS client_active
+       FROM devices d JOIN cpds c ON c.id = d.cpd_id JOIN clients cl ON cl.id = c.client_id
+       WHERE d.mqtt_client_id = ?`,
+      [id],
+    );
+    const dev = rows[0];
+    if (!dev || !dev.active || !dev.cpd_active || !dev.client_active)
+      return res.status(401).json({ error: 'device inválido' });
+
+    // O banco guarda SHA-256 do token; o device envia o token puro
+    const hash     = fwCrypto.createHash('sha256').update(String(token)).digest('hex');
+    const expected = Buffer.from(dev.token, 'utf8');
+    const provided = Buffer.from(hash, 'utf8');
+    if (expected.length !== provided.length || !fwCrypto.timingSafeEqual(expected, provided))
+      return res.status(401).json({ error: 'token inválido' });
+
+    req.deviceId = dev.id;
+    next();
+  } catch (err) { next(err); }
+}
+
+// GET /api/firmware/manifest → { version, file, md5, size }
+router.get('/firmware/manifest', deviceAuth, async (req, res) => {
+  const manifestPath = fwPath.join(FIRMWARE_DIR, 'manifest.json');
+  if (!fwFs.existsSync(manifestPath))
+    return res.status(404).json({ error: 'nenhum firmware publicado' });
+
+  const manifest = JSON.parse(fwFs.readFileSync(manifestPath, 'utf8'));
+  const binPath  = fwPath.join(FIRMWARE_DIR, fwPath.basename(manifest.file || ''));
+  if (!manifest.version || !manifest.file || !fwFs.existsSync(binPath))
+    return res.status(404).json({ error: 'manifest inconsistente' });
+
+  res.json({
+    version: manifest.version,
+    md5:     manifest.md5 || null,
+    size:    fwFs.statSync(binPath).size,
+    url:     '/api/firmware/bin',
+  });
+});
+
+// GET /api/firmware/bin → binário do firmware publicado no manifest
+router.get('/firmware/bin', deviceAuth, async (req, res) => {
+  const manifestPath = fwPath.join(FIRMWARE_DIR, 'manifest.json');
+  if (!fwFs.existsSync(manifestPath)) return res.status(404).end();
+
+  const manifest = JSON.parse(fwFs.readFileSync(manifestPath, 'utf8'));
+  // basename impede path traversal via manifest adulterado
+  const binPath = fwPath.join(FIRMWARE_DIR, fwPath.basename(manifest.file || ''));
+  if (!fwFs.existsSync(binPath)) return res.status(404).end();
+
+  res.setHeader('Content-Type', 'application/octet-stream');
+  if (manifest.md5) res.setHeader('x-md5', manifest.md5);
+  fwFs.createReadStream(binPath).pipe(res);
+});
+
+// ============================================================
+// DEBUG (apenas superadmin)
 // ============================================================
 
 /**
  * POST /api/debug/heartbeat
  * Executa o heartbeat checker imediatamente (sem esperar o cron).
- * Retorna os logs de execução via resposta JSON.
  */
-router.post('/debug/heartbeat', auth, requireRole('admin'), async (req, res) => {
+router.post('/debug/heartbeat', auth, requireRole('superadmin'), async (req, res) => {
   const started = Date.now();
-  const logs = [];
-
-  // Intercepta logs temporariamente
-  const originalInfo  = console.info;
-  const originalWarn  = console.warn;
-  const originalError = console.error;
-
   try {
     await checkHeartbeats();
     res.json({
@@ -637,11 +783,7 @@ router.post('/debug/heartbeat', auth, requireRole('admin'), async (req, res) => 
       message:     'checkHeartbeats executado — veja os logs do container para detalhes',
     });
   } catch (err) {
-    res.status(500).json({
-      ok:    false,
-      error: err.message,
-      stack: err.stack,
-    });
+    res.status(500).json({ ok: false, error: err.message });
   }
 });
 

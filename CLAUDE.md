@@ -14,12 +14,18 @@ cpd-monitor-v2/
 │   │   ├── models/alert.js
 │   │   ├── mqtt/broker.js          Aedes (dev local)
 │   │   ├── mqtt/client.js          cliente Mosquitto (produção)
-│   │   ├── rules/engine.js         regras de alerta
-│   │   ├── rules/heartbeat.js      cron de heartbeat
-│   │   ├── services/influx.service.js
+│   │   ├── rules/engine.js         regras de alerta (temp/umidade)
+│   │   ├── rules/heartbeat.js      cron de heartbeat (comm_failure)
+│   │   ├── services/alert.notifier.js  ponto ÚNICO de notificação (janela, cooldown, call dedup)
+│   │   ├── services/dispatch.retry.js  worker de reenvio (failed + pending órfãos, backoff 2^n min)
+│   │   ├── services/webhook.queue.js   fila anti-rajada de WhatsApp (gap 4s)
+│   │   ├── services/influx.service.js  writer singleton com batch/retry
 │   │   ├── services/webhook.service.js
+│   │   ├── utils/timeWindow.js     janela horário/dia da semana (fuso do CPD)
 │   │   └── utils/logger.js         Winston
-│   ├── config/database.js          pools MySQL + InfluxDB
+│   ├── config/database.js          pools MySQL + InfluxDB (writeApi singleton)
+│   ├── firmware/                   binários OTA + manifest.json (ver README local)
+│   ├── test/                       node --test (npm test)
 │   ├── .env                        variáveis reais (não commitado)
 │   └── package.json                porta padrão: 3001
 │
@@ -92,10 +98,15 @@ Clientes  →  Cliente (ClientDetail: abas Locais | Contatos)
 ### Detalhes de implementação importantes
 
 - **Leituras e alertas são por device, não por CPD.** As telas usam `GET /api/devices/:id/readings` e `GET /api/devices/:id/alerts`. Os endpoints por CPD (`/api/cpds/:id/readings|alerts`) existem no `api.ts` mas não são usados pelas telas atuais.
+- **alert_events são chaveados por device_id** (`findOpenEvent(deviceId, type)`): num CPD com vários sensores, a leitura normal do sensor A não resolve nem deduplica alerta do sensor B. Tipos: temp/hum ±, `comm_failure`/`comm_restored`, `sensor_failure`/`sensor_restored`.
+- **Notificações passam SEMPRE por `alert.notifier.js`** (engine, heartbeat, reconexão, sensor) — janela de horário (fuso do CPD), cooldown (conta `sent`+`pending`, NÃO `failed`), ligação 1×/episódio, canal `both`. Eventos derivados (`comm_restored`, `sensor_*`) usam os inscritos de `comm_failure` com `subscriptionSeverity: 'critical'`.
+- **Retry de dispatches** (`dispatch.retry.js`): cron 1 min reenvia `failed` (backoff 2^attempts min, máx `DISPATCH_MAX_RETRIES`=5) e `pending` órfãos >10 min (fila em memória perdida em restart). Payload remontado do banco.
 - **Thresholds em dois níveis:** limites absolutos por device (`temp_max/min`, `humidity_max/min`) + deltas de severidade por CPD (`severity_warning_delta`, `severity_critical_delta`; vazio = padrão warning 2, critical 5).
-- **Status online/offline** é derivado no frontend: device é "online" se `last_seen_at` está dentro dos últimos 5 minutos.
+- **Status online/offline:** `/api/telemetry` calcula no backend usando `heartbeat_timeout_sec` do CPD (mesma régua do alerta).
 - **alert_subscriptions:** campos `cpd_id` (null = todos os locais), `alert_type` (`all`/`temp_high`/`temp_low`/`humidity_high`/`humidity_low`/`comm_failure`), `channel` (`whatsapp`/`email`/`call`), `severity_min` (`warning`/`critical`), `time_from`/`time_to`, `weekdays_mask` (bitmask Dom=bit0..Sáb=bit6, 127 = todos), `cooldown_minutes`.
+- **Multi-tenant:** TODAS as rotas de detalhe/escrita validam escopo via `cpdInScope`/`deviceInScope`/`contactInScope` (404 fora do escopo). IDs interpolados em Flux passam por `isId()`; limites por `intParam()`.
 - **Dashboard em tempo real:** `DashboardPage` consome SSE via `useSSE<TelemetryReading>('/api/sse', 'telemetry')` — o polling de 15s foi removido.
+- **`/health` é healthcheck real** (MySQL ping + estado da conexão MQTT; 503 se degradado) — usado pelo HEALTHCHECK do Docker e por monitor externo.
 
 ## Endpoints da API
 
@@ -136,6 +147,10 @@ GET    /api/sse?token=                              Server-Sent Events (canal 't
 GET    /api/stats
 GET    /api/telemetry
 GET    /api/dashboard
+
+GET    /api/firmware/manifest                       OTA pull (auth: x-device-id + x-device-token)
+GET    /api/firmware/bin                            binário do firmware publicado
+POST   /api/debug/heartbeat                         superadmin: roda o heartbeat agora
 ```
 
 ## Roles e permissões
@@ -157,21 +172,28 @@ Configurações em `easypanel/`:
 
 - **MySQL**: pool 10 conexões, timezone UTC fixo — não alterar (Hostinger opera em UTC)
 - **InfluxDB 2.x**: env vars `INFLUX_URL`, `INFLUX_TOKEN`, `INFLUX_ORG`, `INFLUX_BUCKET`
-- **Mosquitto**: porta 1883 TCP + 9001 WebSockets, `allow_anonymous false`, auth via `/mosquitto/config/passwd`
-- **Migração pendente**: `easypanel/migrations/add_call_channel.sql` — adiciona canal `call` (Twilio) em `alert_dispatches` e `alert_subscriptions`. Executar antes de ativar chamadas telefônicas.
+- **Mosquitto**: 8883 TLS (devices, internet) + 1883 (APENAS rede interna, backend) + 9001 WS; `allow_anonymous false`, auth via passwd, **ACL por device** (`pattern readwrite cpd/%u/#`; `cpd-backend` → `cpd/#`)
+- **Backend MQTT**: clientId fixo (`MQTT_BACKEND_CLIENT_ID`) + `clean:false` (sessão persistente). Dev local apontando ao broker de produção PRECISA de clientId diferente.
+- **Migrações** em `easypanel/migrations/` (aplicadas até `2026-06-10_reliability.sql`: enum `sensor_failure`/`sensor_restored` + `alert_dispatches.attempts`)
+- **Deploy completo**: ver `DEPLOY.md` (ordem: segredos → Mosquitto TLS/ACL → backend → n8n → firmware)
 
 ## ESP32 Firmware
 
-Firmware em `esp32-firmware-n8n/cpd_monitor/`. Edite apenas `config.h` por dispositivo.
+Firmware **v1.1** em `esp32-firmware-n8n/cpd_monitor/`. Edite apenas `config.h` por dispositivo.
 
 **Tópicos MQTT:**
-- Publica: `cpd/{mqtt_client_id}/data` — payload `{temperature, humidity, ts, rssi, fw}` a cada 30s
-  - **OBS:** `ts` é `millis()` do ESP32 (tempo desde boot), não timestamp absoluto — backend usa hora de chegada
-- Publica: `cpd/{mqtt_client_id}/status` (retain=true) — `online`/`offline`/`pong`/`sensor_error`/`restarting`
-- Subscreve: `cpd/{mqtt_client_id}/cmd` — aceita `restart`, `ping`, `read_now`
+- Publica: `cpd/{mqtt_client_id}/data` — payload `{temperature, humidity, ts, age_ms?, rssi, fw}` a cada 30s
+  - `ts` é `millis()` na CAPTURA (não timestamp absoluto); o backend deriva boot/uptime de `ts + age_ms`
+  - `age_ms` presente = leitura bufferizada offline sendo reenviada — backend grava no Influx com `now - age_ms` e NÃO avalia regras/SSE se `age_ms` > 2 min
+- Publica: `cpd/{mqtt_client_id}/status` — `online` (retain) / `pong`/`sensor_error`/`restarting`/`updating` (sem retain). Backend ignora mensagens retained no tópico status.
+- Subscreve: `cpd/{mqtt_client_id}/cmd` — `restart`, `ping`, `read_now`, `update` (força checagem OTA)
 - LWT: `cpd/{mqtt_client_id}/status` → `{"status":"offline"}` retain=true
 
-**Auth MQTT:** username=`mqtt_client_id`, password=`token` (SHA-256 retornado ao provisionar o device)
+**Auth MQTT:** username=`mqtt_client_id`, password=token puro do provisionamento (o banco guarda o SHA-256; broker.js/deviceAuth hasheiam o recebido antes de comparar)
+
+**Resiliência (v1.1):** TLS com CA Let's Encrypt embarcado; backoff exponencial+jitter (5s→5min) sem boot-loop; buffer offline de 2h em RAM; Wi-Fi caído 15 min → restart; sensor morto → 1 restart e depois permanece online publicando `sensor_error` (vira alerta de FALHA DE SENSOR no backend, não comm_failure)
+
+**OTA remoto (pull):** device consulta `GET /api/firmware/manifest` a cada 6h (ou cmd `update`) com headers `x-device-id`/`x-device-token`; binários publicados em `backend/firmware/` (ver README local). ArduinoOTA local opcional via `ENABLE_LOCAL_OTA`.
 
 ## Pipeline de Alertas (n8n)
 
@@ -185,7 +207,7 @@ Workflow em `esp32-firmware-n8n/n8n fluxo.json`.
 | `call` | Twilio via HTTP Request (from: +551150285828) | ativo — requer migração SQL |
 
 
-**Secret do webhook:** configurar `CPD_WEBHOOK_SECRET` como variável de ambiente no n8n (não deixar hardcoded).
+**Secret do webhook:** o nó "Valida e extrai payload" lê `$env.CPD_WEBHOOK_SECRET` (mesma string de `N8N_WEBHOOK_SECRET` do backend) e falha se ausente. O SID da Twilio vem de `$env.TWILIO_ACCOUNT_SID`. Os nós Evolution/Twilio têm `onError: continueErrorOutput` → "Responde 500" (backend marca `failed` e o worker reenvia).
 
 **Payload enviado pelo backend para o n8n:**
 ```json
