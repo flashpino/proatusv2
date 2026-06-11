@@ -5,6 +5,9 @@ server {
     root /usr/share/nginx/html;
     index index.html;
 
+    # Permite upload de firmware (.bin) de até 10 MB
+    client_max_body_size 10m;
+
     # Proxy da API (REST + SSE) para o serviço backend.
     # ${BACKEND_URL} é injetado por envsubst a partir da env BACKEND_URL.
     # Ex.: BACKEND_URL=http://cpd-monitor-v2_backend:3001
