@@ -182,9 +182,11 @@ async function findEligibleSubscriptions(cpdId, alertType, severity) {
        con.client_id
      FROM alert_subscriptions sub
      JOIN contacts con ON con.id = sub.contact_id
+     JOIN cpds cpd     ON cpd.id = ?
      WHERE sub.active = 1
        AND con.active = 1
-       AND (sub.cpd_id = ? OR sub.cpd_id IS NULL)
+       AND con.client_id = cpd.client_id
+       AND (sub.cpd_id = cpd.id OR sub.cpd_id IS NULL)
        AND (sub.alert_type = ? OR sub.alert_type = 'all')
      ORDER BY sub.contact_id`,
     [cpdId, alertType],
